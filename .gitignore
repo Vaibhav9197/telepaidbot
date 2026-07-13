@@ -2,6 +2,7 @@
 *.session*
 *.vscode*
 .env
+config.env
 config.env.local
 *.log
 *.json
