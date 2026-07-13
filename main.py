@@ -320,6 +320,9 @@ async def handle_download(bot: Client, message: Message, post_url: str):
         except KeyError as e:
             LOGGER(__name__).error(f"KeyError for {post_url}: {e}")
             await message.reply(f"**❌ Invalid URL format:** `{e}`")
+        except ValueError as e:
+            LOGGER(__name__).warning(f"Invalid post URL {post_url}: {e}")
+            await message.reply(f"**❌ {e}**")
         except Exception as e:
             LOGGER(__name__).error(f"Unexpected error for {post_url}: {e}")
             await message.reply("**❌ An unexpected error occurred.** Check /logs for details.")

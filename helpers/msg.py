@@ -12,10 +12,18 @@ STORY_LINK_RE = re.compile(
 )
 
 
+def sanitize_link(link: str) -> str:
+    """Strip whitespace and surrounding angle brackets that some Telegram
+    clients add around pasted URLs (e.g. ``<https://t.me/c/123/456>``)."""
+    if not link:
+        return link
+    return link.strip().strip("<>").strip()
+
+
 def is_story_link(link: str) -> bool:
     if not link:
         return False
-    return STORY_LINK_RE.match(link.strip()) is not None
+    return STORY_LINK_RE.match(sanitize_link(link)) is not None
 
 
 def get_raw_text(text, entities):
@@ -26,7 +34,7 @@ def getStoryChatMsgID(link: str):
     if not link:
         raise ValueError("Please send a valid Telegram story URL.")
 
-    cleaned = link.split("?", 1)[0].strip()
+    cleaned = sanitize_link(link).split("?", 1)[0].strip()
     match = STORY_LINK_RE.match(cleaned)
     if not match:
         raise ValueError(
@@ -43,6 +51,7 @@ def getStoryChatMsgID(link: str):
 
 
 def getChatMsgID(link: str):
+    link = sanitize_link(link)
     linkps = link.split("/")
     chat_id, message_thread_id, message_id = None, None, None
     
