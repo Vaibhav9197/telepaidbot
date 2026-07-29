@@ -42,6 +42,14 @@ MIN_PARALLEL_SIZE = 2 * 1024 * 1024
 # chunk would earn a FloodWait on editMessageText instead of a faster download.
 PROGRESS_INTERVAL = 5
 
+# Session.invoke retries internally (10 times, 15s apart by default) before
+# raising, and fetch_chunk then retries on top of that. Left at the defaults the
+# two multiply: 4 x 10 invokes is ~11 minutes spent on a single chunk, after
+# which the whole file restarts on the sequential path anyway. Cap the inner
+# budget so an unreachable chunk gives up in tens of seconds instead.
+CHUNK_INVOKE_RETRIES = 2
+CHUNK_INVOKE_TIMEOUT = 15
+
 MEDIA_ATTRS = (
     "document",
     "video",
@@ -191,7 +199,7 @@ async def close_sessions(sessions) -> None:
             LOGGER(__name__).warning(f"Failed to stop media session: {e}")
 
 
-async def fetch_chunk(session, location, offset: int, attempts: int = 4) -> bytes:
+async def fetch_chunk(session, location, offset: int, attempts: int = 3) -> bytes:
     for attempt in range(attempts):
         try:
             result = await session.invoke(
@@ -200,6 +208,8 @@ async def fetch_chunk(session, location, offset: int, attempts: int = 4) -> byte
                     offset=offset,
                     limit=CHUNK_SIZE,
                 ),
+                retries=CHUNK_INVOKE_RETRIES,
+                timeout=CHUNK_INVOKE_TIMEOUT,
                 sleep_threshold=30,
             )
         except FloodWait as e:
