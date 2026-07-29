@@ -210,7 +210,9 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                 progress_message = await message.reply("**📥 Downloading Progress...**")
 
                 filename = get_file_name(message_id, chat_message)
-                download_path = get_download_path(message.id, filename)
+                download_path = get_download_path(
+                    message.id, filename, item_id=message_id
+                )
 
                 media_path = await download_with_fallback(
                     chat_message, download_path, progress_message, start_time
@@ -379,7 +381,9 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
             progress_message = await message.reply("**📥 Downloading Story...**")
 
             filename = get_story_file_name(story_id, story, chat_username)
-            download_path = get_download_path(message.id, filename)
+            download_path = get_download_path(
+                message.id, filename, item_id=story_id
+            )
 
             media_path = await download_with_fallback(
                 story, download_path, progress_message, start_time

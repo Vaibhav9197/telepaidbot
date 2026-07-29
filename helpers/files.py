@@ -9,11 +9,21 @@ from logger import LOGGER
 
 SIZE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
 
-def get_download_path(folder_id: int, filename: str, root_dir: str = "downloads") -> str:
+def get_download_path(
+    folder_id: int,
+    filename: str,
+    root_dir: str = "downloads",
+    item_id=None,
+) -> str:
     safe_name = os.path.basename(filename)
     if not safe_name:
         safe_name = str(folder_id)
     folder = os.path.join(root_dir, str(folder_id))
+    # Telegram hands out the same file_name for every clip recorded in the same
+    # second, so two posts in one batch routinely collide. Give each item its own
+    # subfolder, or concurrent downloads write into a single file and corrupt it.
+    if item_id is not None:
+        folder = os.path.join(folder, str(item_id))
     os.makedirs(folder, exist_ok=True)
     full_path = os.path.realpath(os.path.join(folder, safe_name))
     real_root = os.path.realpath(folder)
@@ -32,9 +42,15 @@ def cleanup_download(path: str) -> None:
         if os.path.exists(path + ".temp"):
             os.remove(path + ".temp")
 
-        folder = os.path.dirname(path)
-        if os.path.isdir(folder) and not os.listdir(folder):
+        # Walk back up the per-item and per-request folders, pruning whatever is
+        # left empty, but never past the downloads root itself.
+        root = os.path.realpath("downloads")
+        folder = os.path.dirname(os.path.realpath(path))
+        while os.path.isdir(folder) and folder != root and folder.startswith(root):
+            if os.listdir(folder):
+                break
             os.rmdir(folder)
+            folder = os.path.dirname(folder)
 
     except Exception as e:
         LOGGER(__name__).error(f"Cleanup failed for {path}: {e}")

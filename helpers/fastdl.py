@@ -13,6 +13,7 @@
 # skips (CDN redirects, chat photos, unknown sizes).
 
 import os
+import shutil
 import asyncio
 import inspect
 from time import monotonic
@@ -47,8 +48,69 @@ MEDIA_ATTRS = (
 )
 
 
+# How hard to try moving a finished download into place. Cloud-sync clients and
+# antivirus scanners routinely hold a brand-new file open for a moment, and on
+# Windows that blocks the rename outright.
+FINALIZE_ATTEMPTS = 6
+FINALIZE_INITIAL_DELAY = 0.25
+
+
 class FastDownloadUnavailable(Exception):
     """This file can't take the parallel path; the caller should fall back."""
+
+
+async def finalize(temp_path: str, file_path: str) -> None:
+    """Move a completed download into its final name.
+
+    On Windows a freshly written file is often still held briefly by OneDrive or
+    an antivirus scanner, which surfaces as WinError 32. Every byte is already on
+    disk by this point, so wait the lock out and, failing that, copy the bytes
+    across -- re-downloading a file we already have is never the right answer.
+    """
+    delay = FINALIZE_INITIAL_DELAY
+
+    for attempt in range(FINALIZE_ATTEMPTS):
+        try:
+            os.replace(temp_path, file_path)
+            return
+        except OSError as e:
+            if attempt == FINALIZE_ATTEMPTS - 1:
+                LOGGER(__name__).warning(
+                    f"Rename still blocked after {FINALIZE_ATTEMPTS} attempts "
+                    f"({e.strerror}); copying instead"
+                )
+                break
+            LOGGER(__name__).info(
+                f"Rename blocked ({e.strerror}); retrying in {delay:.2f}s"
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+
+    # A copy only needs read access, so it can still succeed while whatever holds
+    # the file is blocking the delete half of a rename.
+    shutil.copyfile(temp_path, file_path)
+    try:
+        os.remove(temp_path)
+    except OSError as e:
+        LOGGER(__name__).warning(f"Could not remove {temp_path} after copy: {e}")
+
+
+async def run_workers(sessions, worker) -> None:
+    """Run one worker per session, making sure none outlive a failure.
+
+    asyncio.gather re-raises the first exception but leaves its siblings running.
+    Those orphans would keep writing into a file handle the caller is about to
+    close, so cancel them before letting the error escape.
+    """
+    tasks = [asyncio.ensure_future(worker(session)) for session in sessions]
+
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 def extract_media(message):
@@ -112,7 +174,7 @@ async def close_sessions(sessions) -> None:
             LOGGER(__name__).warning(f"Failed to stop media session: {e}")
 
 
-async def fetch_chunk(session, location, offset: int, attempts: int = 3) -> bytes:
+async def fetch_chunk(session, location, offset: int, attempts: int = 4) -> bytes:
     for attempt in range(attempts):
         try:
             result = await session.invoke(
@@ -131,6 +193,18 @@ async def fetch_chunk(session, location, offset: int, attempts: int = 3) -> byte
                 f"FloodWait fetching chunk at offset {offset}: {wait_s}s"
             )
             await asyncio.sleep(wait_s + 1)
+            continue
+        except (OSError, asyncio.TimeoutError) as e:
+            # Holding many connections open makes the occasional reset routine.
+            # Retry the chunk instead of losing the whole file to one dropped
+            # socket; Pyrogram reconnects the session underneath us.
+            if attempt == attempts - 1:
+                raise
+            LOGGER(__name__).warning(
+                f"Connection error on chunk at offset {offset} "
+                f"({type(e).__name__}: {e}); retrying"
+            )
+            await asyncio.sleep(1 + attempt)
             continue
 
         if isinstance(result, raw.types.upload.File):
@@ -234,7 +308,7 @@ async def fast_download(
                     downloaded += len(chunk)
                     await report()
 
-            await asyncio.gather(*(worker(session) for session in sessions))
+            await run_workers(sessions, worker)
 
         actual_size = os.path.getsize(temp_path)
         if actual_size != file_size:
@@ -242,7 +316,7 @@ async def fast_download(
                 f"size mismatch: wrote {actual_size} of {file_size} bytes"
             )
 
-        os.replace(temp_path, file_path)
+        await finalize(temp_path, file_path)
         await report(force=True)
 
         LOGGER(__name__).info(

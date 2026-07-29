@@ -356,8 +356,11 @@ async def processMediaGroup(chat_message, bot, message, forward_chat_id=None):
     for msg in media_group_messages:
         if msg.photo or msg.video or msg.document or msg.audio:
             # An explicit path is what lets the parallel downloader take over;
-            # without one it can't place the chunks itself.
-            item_path = get_download_path(message.id, get_file_name(msg.id, msg))
+            # without one it can't place the chunks itself. item_id keeps album
+            # entries apart when Telegram gives them the same file_name.
+            item_path = get_download_path(
+                message.id, get_file_name(msg.id, msg), item_id=msg.id
+            )
             download_tasks.append(
                 download_single_media(msg, progress_message, start_time, item_path)
             )

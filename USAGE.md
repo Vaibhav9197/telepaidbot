@@ -54,10 +54,16 @@ on, so a bad setting degrades speed rather than breaking downloads.
 Concurrency settings, which trade FloodWait risk for batch throughput:
 
 ```env
-MAX_CONCURRENT_DOWNLOADS=2
-BATCH_SIZE=2
+MAX_CONCURRENT_DOWNLOADS=1
+BATCH_SIZE=1
 FLOOD_WAIT_DELAY=5
 ````
+
+Open connections are `DOWNLOAD_WORKERS × MAX_CONCURRENT_DOWNLOADS`. Keep
+`MAX_CONCURRENT_DOWNLOADS=1` while `DOWNLOAD_WORKERS` is high — the parallel
+downloader already saturates your line on a single file, and downloading two
+files at once on top of that mostly buys dropped sockets. If you see repeated
+`ConnectionResetError: Connection lost`, that product is too large.
 
 Optional auto-forward setting:
 
