@@ -239,19 +239,24 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                     if chat_message.audio
                     else "document"
                 )
-                await send_media(
-                    bot,
-                    message,
-                    media_path,
-                    media_type,
-                    raw_caption,
-                    raw_caption_entities,
-                    progress_message,
-                    start_time,
-                    forward_chat_id=effective_forward_chat_id,
-                )
+                try:
+                    await send_media(
+                        bot,
+                        message,
+                        media_path,
+                        media_type,
+                        raw_caption,
+                        raw_caption_entities,
+                        progress_message,
+                        start_time,
+                        forward_chat_id=effective_forward_chat_id,
+                    )
+                finally:
+                    # Release the disk even when the upload fails. Without this a
+                    # failed send strands the file for the rest of the run, and a
+                    # few 600 MB leftovers fill the disk quickly.
+                    cleanup_download(media_path)
 
-                cleanup_download(media_path)
                 await progress_message.delete()
 
             elif chat_message.poll:
@@ -406,19 +411,21 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
             )
 
             media_type = "video" if story.video else "photo"
-            await send_media(
-                bot,
-                message,
-                media_path,
-                media_type,
-                raw_caption,
-                raw_caption_entities,
-                progress_message,
-                start_time,
-                forward_chat_id=effective_forward_chat_id,
-            )
+            try:
+                await send_media(
+                    bot,
+                    message,
+                    media_path,
+                    media_type,
+                    raw_caption,
+                    raw_caption_entities,
+                    progress_message,
+                    start_time,
+                    forward_chat_id=effective_forward_chat_id,
+                )
+            finally:
+                cleanup_download(media_path)
 
-            cleanup_download(media_path)
             await progress_message.delete()
 
         except FloodWait as e:
