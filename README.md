@@ -94,6 +94,8 @@ docker compose down
 
 > **Note:** Make sure that your user session is a member of the source chat or channel before downloading. For story downloads, the user session must be able to view the story (e.g., follow the user / be in the channel). Stories are only visible for 24h unless pinned.
 
+See [COMMANDS.md](COMMANDS.md) for the full reference — what each command accepts, what it replies, and the rules for the batch ranges.
+
 ## Author
 
 - Name: Bisnu Ray
