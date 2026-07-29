@@ -394,104 +394,108 @@ async def processMediaGroup(chat_message, bot, message, forward_chat_id=None):
 
     LOGGER(__name__).info(f"Valid media count: {len(valid_media)}")
 
-    if valid_media:
-        sent_messages = []
-        try:
-            for attempt in range(3):
-                try:
-                    sent_messages = await bot.send_media_group(chat_id=message.chat.id, media=valid_media)
-                    await progress_message.delete()
-                    break
-                except FloodWait as e:
-                    wait_s = int(getattr(e, "value", 0) or 0)
-                    LOGGER(__name__).warning(f"FloodWait while sending media group: {wait_s}s")
-                    if wait_s > 0 and attempt < 2:
-                        await asyncio.sleep(wait_s + 1)
-                        continue
-                    raise
-                except BadRequest as e:
-                    if "ENTITY_TEXT_INVALID" in str(e) and attempt == 0:
-                        LOGGER(__name__).warning(f"ENTITY_TEXT_INVALID in media group, retrying without caption entities: {e}")
-                        for m in valid_media:
-                            m.caption_entities = None
-                        continue
-                    raise
-        except Exception:
-            await message.reply(
-                "**❌ Failed to send media group, trying individual uploads**"
-            )
-            for media in valid_media:
-                try:
-                    sent = None
-                    if isinstance(media, InputMediaPhoto):
-                        sent = await bot.send_photo(
-                            chat_id=message.chat.id,
-                            photo=media.media,
-                            caption=media.caption,
-                        )
-                    elif isinstance(media, InputMediaVideo):
-                        sent = await bot.send_video(
-                            chat_id=message.chat.id,
-                            video=media.media,
-                            caption=media.caption,
-                        )
-                    elif isinstance(media, InputMediaDocument):
-                        sent = await bot.send_document(
-                            chat_id=message.chat.id,
-                            document=media.media,
-                            caption=media.caption,
-                        )
-                    elif isinstance(media, InputMediaAudio):
-                        sent = await bot.send_audio(
-                            chat_id=message.chat.id,
-                            audio=media.media,
-                            caption=media.caption,
-                        )
-                    elif isinstance(media, Voice):
-                        sent = await bot.send_voice(
-                            chat_id=message.chat.id,
-                            voice=media.media,
-                            caption=media.caption,
-                        )
-                    if sent:
-                        sent_messages.append(sent)
-                except Exception as individual_e:
-                    await message.reply(
-                        f"Failed to upload individual media: {individual_e}"
-                    )
-
-            await progress_message.delete()
-
-        if forward_chat_id and sent_messages:
+    # Cleanup lives in a finally spanning both outcomes. An album is several
+    # files at once, and a FloodWait on any reply or delete on the way out would
+    # otherwise leak the whole group. temp_paths is only ever appended alongside
+    # valid_media, so this covers exactly what the per-branch cleanups did.
+    try:
+        if valid_media:
+            sent_messages = []
             try:
-                msg_ids = [m.id for m in sent_messages if m]
-                if msg_ids:
-                    source_chat_id = sent_messages[0].chat.id
-                    for attempt in range(2):
-                        try:
-                            await bot.copy_media_group(
-                                chat_id=forward_chat_id,
-                                from_chat_id=source_chat_id,
-                                message_id=msg_ids[0],
+                for attempt in range(3):
+                    try:
+                        sent_messages = await bot.send_media_group(chat_id=message.chat.id, media=valid_media)
+                        await progress_message.delete()
+                        break
+                    except FloodWait as e:
+                        wait_s = int(getattr(e, "value", 0) or 0)
+                        LOGGER(__name__).warning(f"FloodWait while sending media group: {wait_s}s")
+                        if wait_s > 0 and attempt < 2:
+                            await asyncio.sleep(wait_s + 1)
+                            continue
+                        raise
+                    except BadRequest as e:
+                        if "ENTITY_TEXT_INVALID" in str(e) and attempt == 0:
+                            LOGGER(__name__).warning(f"ENTITY_TEXT_INVALID in media group, retrying without caption entities: {e}")
+                            for m in valid_media:
+                                m.caption_entities = None
+                            continue
+                        raise
+            except Exception:
+                await message.reply(
+                    "**❌ Failed to send media group, trying individual uploads**"
+                )
+                for media in valid_media:
+                    try:
+                        sent = None
+                        if isinstance(media, InputMediaPhoto):
+                            sent = await bot.send_photo(
+                                chat_id=message.chat.id,
+                                photo=media.media,
+                                caption=media.caption,
                             )
-                            LOGGER(__name__).info(f"Copied media group to chat: {forward_chat_id}")
-                            break
-                        except FloodWait as e:
-                            wait_s = int(getattr(e, "value", 0) or 0)
-                            LOGGER(__name__).warning(f"FloodWait while copying media group: {wait_s}s")
-                            if wait_s > 0 and attempt == 0:
-                                await asyncio.sleep(wait_s + 1)
-                                continue
-                            raise
-            except Exception as e:
-                LOGGER(__name__).error(f"Failed to copy media group to {forward_chat_id}: {e}")
+                        elif isinstance(media, InputMediaVideo):
+                            sent = await bot.send_video(
+                                chat_id=message.chat.id,
+                                video=media.media,
+                                caption=media.caption,
+                            )
+                        elif isinstance(media, InputMediaDocument):
+                            sent = await bot.send_document(
+                                chat_id=message.chat.id,
+                                document=media.media,
+                                caption=media.caption,
+                            )
+                        elif isinstance(media, InputMediaAudio):
+                            sent = await bot.send_audio(
+                                chat_id=message.chat.id,
+                                audio=media.media,
+                                caption=media.caption,
+                            )
+                        elif isinstance(media, Voice):
+                            sent = await bot.send_voice(
+                                chat_id=message.chat.id,
+                                voice=media.media,
+                                caption=media.caption,
+                            )
+                        if sent:
+                            sent_messages.append(sent)
+                    except Exception as individual_e:
+                        await message.reply(
+                            f"Failed to upload individual media: {individual_e}"
+                        )
 
+                await progress_message.delete()
+
+            if forward_chat_id and sent_messages:
+                try:
+                    msg_ids = [m.id for m in sent_messages if m]
+                    if msg_ids:
+                        source_chat_id = sent_messages[0].chat.id
+                        for attempt in range(2):
+                            try:
+                                await bot.copy_media_group(
+                                    chat_id=forward_chat_id,
+                                    from_chat_id=source_chat_id,
+                                    message_id=msg_ids[0],
+                                )
+                                LOGGER(__name__).info(f"Copied media group to chat: {forward_chat_id}")
+                                break
+                            except FloodWait as e:
+                                wait_s = int(getattr(e, "value", 0) or 0)
+                                LOGGER(__name__).warning(f"FloodWait while copying media group: {wait_s}s")
+                                if wait_s > 0 and attempt == 0:
+                                    await asyncio.sleep(wait_s + 1)
+                                    continue
+                                raise
+                except Exception as e:
+                    LOGGER(__name__).error(f"Failed to copy media group to {forward_chat_id}: {e}")
+
+            return True
+
+        await progress_message.delete()
+        await message.reply("❌ No valid media found in the media group.")
+        return False
+    finally:
         for path in temp_paths + invalid_paths:
             cleanup_download(path)
-        return True
-
-    await progress_message.delete()
-    await message.reply("❌ No valid media found in the media group.")
-    for path in invalid_paths:
-        cleanup_download(path)
-    return False
