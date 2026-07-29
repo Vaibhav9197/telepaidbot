@@ -55,7 +55,9 @@ Concurrency settings, which trade FloodWait risk for batch throughput:
 
 ```env
 MAX_CONCURRENT_DOWNLOADS=1
-BATCH_SIZE=1
+MAX_CONCURRENT_UPLOADS=1
+PIPELINE_DEPTH=3
+DISK_MIN_FREE_GB=2
 FLOOD_WAIT_DELAY=5
 ````
 
@@ -64,6 +66,32 @@ Open connections are `DOWNLOAD_WORKERS × MAX_CONCURRENT_DOWNLOADS`. Keep
 downloader already saturates your line on a single file, and downloading two
 files at once on top of that mostly buys dropped sockets. If you see repeated
 `ConnectionResetError: Connection lost`, that product is too large.
+
+### Downloads and uploads run at the same time
+
+Downloading and uploading are gated separately, so while one video is being sent
+to you the next one is already being fetched. On most connections the upload is
+the slower leg, so this hides the download time almost entirely.
+
+`PIPELINE_DEPTH` is how many items may be in flight at once — downloading,
+waiting to upload, or uploading. At the default of `3`, downloads run up to two
+items ahead of the uploader. Uploads stay serialized, so a batch still arrives
+in order.
+
+**This is also your disk budget.** Every in-flight item holds a file, and the
+parallel downloader reserves a file's full size the moment it starts, so peak
+disk use is about `PIPELINE_DEPTH × file size` — roughly 1.8 GB for three 600 MB
+videos. Lower it to `2`, or to `1` to turn pipelining off entirely, if space is
+tight.
+
+`DISK_MIN_FREE_GB` is held in reserve. A download that would not fit waits for
+an in-flight upload to finish and release its file, and only gives up (with a
+clear message) if space never appears — rather than dying partway through a
+600 MB transfer.
+
+`BATCH_SIZE` has been replaced by `PIPELINE_DEPTH`. If your `config.env` still
+sets `BATCH_SIZE=1`, it is now ignored and no longer forces one-at-a-time
+behaviour.
 
 Optional auto-forward setting:
 

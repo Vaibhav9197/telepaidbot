@@ -41,8 +41,19 @@ class PyroConf(object):
     BOT_START_TIME = time()
 
     MAX_CONCURRENT_DOWNLOADS = int(getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
-    BATCH_SIZE = int(getenv("BATCH_SIZE", "1"))
     FLOOD_WAIT_DELAY = int(getenv("FLOOD_WAIT_DELAY", "10"))
+
+    # Uploads are gated separately from downloads so a finished download can hand
+    # off and let the next file start while the previous one is still going out.
+    MAX_CONCURRENT_UPLOADS = max(1, min(int(getenv("MAX_CONCURRENT_UPLOADS", "1")), 8))
+
+    # Items in flight at once, counting anything downloading, waiting to upload,
+    # or uploading. Each one holds a file on disk, so this is the disk bound:
+    # roughly PIPELINE_DEPTH x file size.
+    PIPELINE_DEPTH = max(1, min(int(getenv("PIPELINE_DEPTH", "3")), 16))
+
+    # Free space kept in reserve before a download is allowed to begin.
+    DISK_MIN_FREE_GB = max(0, int(getenv("DISK_MIN_FREE_GB", "2")))
 
     # Parallel media sessions used per file. Telegram throttles per connection,
     # so this is the knob that actually moves download speed. 1 disables the
