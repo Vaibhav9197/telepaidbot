@@ -44,7 +44,7 @@ Before you begin, ensure you have met the following requirements:
    - **`FORWARD_CHAT_ID`**: Optional. Set a target channel/group chat ID (example: `-1001234567890`) to automatically copy downloaded content there. Leave empty to disable.
 
 3. Optional performance settings (add to `config.env`):
-   - **`DOWNLOAD_WORKERS`**: Parallel connections used per file (default: 8, max 16). Telegram throttles per connection rather than per account, so raising this is what actually increases download speed — no Premium needed. Set to `1` to disable and use the original single-connection path.
+   - **`DOWNLOAD_WORKERS`**: Parallel connections used per file (default: 8, max 16). Telegram throttles per connection rather than per account, so raising this usually increases download speed — no Premium needed. **On an unstable connection it can make things slower**, because every dropped connection costs a retry. Run `python benchmark_speed.py <url>` to measure your own line and set this to whichever row wins; `1` disables the parallel path.
    - **`MAX_CONCURRENT_TRANSMISSIONS`**: Concurrent transfers Pyrogram permits; also gates uploads back to Telegram (default: 4)
    - **`MAX_CONCURRENT_DOWNLOADS`**: Number of simultaneous downloads (default: 1)
    - **`MAX_CONCURRENT_UPLOADS`**: Number of simultaneous uploads (default: 1). Gated separately from downloads, so the next file starts downloading while the previous one is still uploading.

@@ -23,11 +23,13 @@ from pyrogram import Client
 from config import PyroConf
 from helpers.fastdl import (
     CHUNK_SIZE,
+    RETRY_STATS,
     build_location,
     extract_media,
     fetch_chunk,
     open_sessions,
     close_sessions,
+    reset_retry_stats,
 )
 from helpers.msg import getChatMsgID
 from pyrogram.file_id import FileId
@@ -49,6 +51,7 @@ async def measure(client, message, workers, sample_bytes):
     next_chunk = 0
     fetched = 0
     lock = asyncio.Lock()
+    reset_retry_stats()
 
     async def worker(session):
         nonlocal next_chunk, fetched
@@ -68,7 +71,13 @@ async def measure(client, message, workers, sample_bytes):
         await close_sessions(sessions)
 
     elapsed = max(monotonic() - started, 1e-6)
-    return fetched / elapsed / MB, fetched / MB, elapsed, workers
+    return (
+        fetched / elapsed / MB,
+        fetched / MB,
+        elapsed,
+        workers,
+        dict(RETRY_STATS),
+    )
 
 
 async def main():
@@ -111,23 +120,26 @@ async def main():
 
         print(f"File: {media.file_size / MB:.1f} MB "
               f"on DC{FileId.decode(media.file_id).dc_id}\n")
-        print(f"{'workers':>8}  {'MB/s':>8}  {'vs 1 conn':>10}  detail")
-        print("-" * 52)
+        print(f"{'workers':>8}  {'MB/s':>8}  {'vs 1 conn':>10}  "
+              f"{'resets':>7}  {'floods':>7}  detail")
+        print("-" * 72)
 
         baseline = None
         for n in worker_counts:
             try:
-                speed, got, elapsed, used = await measure(
+                speed, got, elapsed, used, stats = await measure(
                     user, message, n, sample_mb * MB
                 )
             except Exception as e:
-                print(f"{n:>8}  {'ERROR':>8}  {'':>10}  {type(e).__name__}: {e}")
+                print(f"{n:>8}  {'ERROR':>8}  {'':>10}  {'':>7}  {'':>7}  "
+                      f"{type(e).__name__}: {e}")
                 continue
 
             if baseline is None:
                 baseline = speed
             ratio = speed / baseline if baseline else 0
             print(f"{used:>8}  {speed:>8.2f}  {ratio:>9.2f}x  "
+                  f"{stats['connection']:>7}  {stats['flood']:>7}  "
                   f"{got:.0f} MB in {elapsed:.1f}s")
 
             # Give Telegram a moment between runs so one trial does not
@@ -135,9 +147,14 @@ async def main():
             await asyncio.sleep(2)
 
         print()
-        print("If MB/s barely rises with more workers, the limit is your line or")
-        print("Telegram's per-account cap, and DOWNLOAD_WORKERS cannot help.")
-        print("If it scales, set DOWNLOAD_WORKERS to the best value above.")
+        print("Set DOWNLOAD_WORKERS to whichever row is fastest.")
+        print()
+        print("If MB/s barely rises with more workers, the ceiling is your line")
+        print("or an account-level cap, and DOWNLOAD_WORKERS cannot help.")
+        print("If MB/s DROPS as workers rise, check the resets column: parallel")
+        print("connections only pay off on a link that keeps them alive, and a")
+        print("connection being reset repeatedly is a network problem no setting")
+        print("in this bot can fix. Retrying it is what costs the throughput.")
     finally:
         await user.stop()
 

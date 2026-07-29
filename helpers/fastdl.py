@@ -55,6 +55,17 @@ FINALIZE_ATTEMPTS = 6
 FINALIZE_INITIAL_DELAY = 0.25
 
 
+# Retry counters, so a slow download can be attributed rather than guessed at.
+# Parallel connections only pay off on a link that keeps them alive; if these
+# climb, more workers make things worse, not better.
+RETRY_STATS = {"flood": 0, "connection": 0}
+
+
+def reset_retry_stats() -> None:
+    RETRY_STATS["flood"] = 0
+    RETRY_STATS["connection"] = 0
+
+
 class FastDownloadUnavailable(Exception):
     """This file can't take the parallel path; the caller should fall back."""
 
@@ -187,6 +198,7 @@ async def fetch_chunk(session, location, offset: int, attempts: int = 4) -> byte
             )
         except FloodWait as e:
             wait_s = int(getattr(e, "value", 0) or 0)
+            RETRY_STATS["flood"] += 1
             if attempt == attempts - 1:
                 raise
             LOGGER(__name__).warning(
@@ -195,6 +207,7 @@ async def fetch_chunk(session, location, offset: int, attempts: int = 4) -> byte
             await asyncio.sleep(wait_s + 1)
             continue
         except (OSError, asyncio.TimeoutError) as e:
+            RETRY_STATS["connection"] += 1
             # Holding many connections open makes the occasional reset routine.
             # Retry the chunk instead of losing the whole file to one dropped
             # socket; Pyrogram reconnects the session underneath us.

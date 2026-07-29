@@ -38,14 +38,34 @@ DOWNLOAD_WORKERS=8
 MAX_CONCURRENT_TRANSMISSIONS=4
 ```
 
-`DOWNLOAD_WORKERS` is the one that matters. Telegram throttles download speed
-**per connection**, not per account, so the bot splits each file across this many
-parallel connections to the same datacenter and reassembles it locally. This is
-why official Telegram apps feel fast, and it needs no Premium subscription.
+`DOWNLOAD_WORKERS` is the one that matters — but **measure before you raise it.**
 
-- `8` — good balance, typically several times faster than a single connection
-- `12`–`16` — faster still, but more likely to draw a FloodWait
-- `1` — disables parallel downloads (original sequential behaviour)
+Telegram throttles download speed per connection rather than per account, so
+splitting a file across several connections to the same datacenter usually
+multiplies throughput, with no Premium subscription needed. That is the theory,
+and it holds on a stable link.
+
+It does not hold on an unstable one. Parallel connections only pay off if the
+network keeps them alive; if connections are being reset, every reset costs a
+retry and more workers make the download **slower**. On the connection this was
+developed against, 4 workers measured 0.44 MB/s versus 1.31 MB/s on a single
+connection — three times worse.
+
+So run the benchmark and let it decide:
+
+```sh
+python benchmark_speed.py https://t.me/c/1234567890/42
+```
+
+It samples a few MB at 1, 2, 4 and 8 connections and prints MB/s alongside a
+reset count for each. Set `DOWNLOAD_WORKERS` to whichever row wins:
+
+- scales up with workers — use the fastest value, `8` or higher
+- flat — the ceiling is your line or your account; leave it at `1`
+- drops, with resets climbing — a network problem. Leave it at `1`; no setting
+  here can fix a link that keeps dropping connections
+
+`1` disables the parallel path entirely and uses Pyrogram's own downloader.
 
 Files under 2 MB and any file Telegram serves via a CDN redirect automatically
 use the normal single-connection path, as does anything the parallel path fails
