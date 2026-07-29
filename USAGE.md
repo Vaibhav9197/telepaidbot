@@ -34,7 +34,7 @@ Open `config.env` and replace the placeholders:
 Speed settings:
 
 ```env
-DOWNLOAD_WORKERS=8
+DOWNLOAD_WORKERS=1
 MAX_CONCURRENT_TRANSMISSIONS=4
 ```
 
@@ -48,7 +48,7 @@ and it holds on a stable link.
 It does not hold on an unstable one. Parallel connections only pay off if the
 network keeps them alive; if connections are being reset, every reset costs a
 retry and more workers make the download **slower**. On the connection this was
-developed against, 4 workers measured 0.44 MB/s versus 1.31 MB/s on a single
+developed against, 4 workers measured 0.44 MB/s against 1.31 MB/s on a single
 connection — three times worse.
 
 So run the benchmark and let it decide:
@@ -60,12 +60,20 @@ python benchmark_speed.py https://t.me/c/1234567890/42
 It samples a few MB at 1, 2, 4 and 8 connections and prints MB/s alongside a
 reset count for each. Set `DOWNLOAD_WORKERS` to whichever row wins:
 
-- scales up with workers — use the fastest value, `8` or higher
-- flat — the ceiling is your line or your account; leave it at `1`
-- drops, with resets climbing — a network problem. Leave it at `1`; no setting
-  here can fix a link that keeps dropping connections
+- **scales up** with workers — use the fastest value, `8` or higher
+- **flat** — the ceiling is your line or your account; leave it at `1`
+- **drops, with resets climbing** — a network problem. Leave it at `1`; no
+  setting here can fix a link that keeps dropping connections
 
 `1` disables the parallel path entirely and uses Pyrogram's own downloader.
+
+Both paths log their throughput on completion, so a normal run tells you what
+you actually got:
+
+```
+Fast download finished: 622.0 MB over 8 connections in 71.3s = 8.73 MB/s
+Sequential download finished: 622.0 MB in 475.1s = 1.31 MB/s
+```
 
 Files under 2 MB and any file Telegram serves via a CDN redirect automatically
 use the normal single-connection path, as does anything the parallel path fails
@@ -75,9 +83,7 @@ Concurrency settings, which trade FloodWait risk for batch throughput:
 
 ```env
 MAX_CONCURRENT_DOWNLOADS=1
-MAX_CONCURRENT_UPLOADS=1
-PIPELINE_DEPTH=3
-DISK_MIN_FREE_GB=2
+BATCH_SIZE=1
 FLOOD_WAIT_DELAY=5
 ````
 
@@ -86,32 +92,6 @@ Open connections are `DOWNLOAD_WORKERS × MAX_CONCURRENT_DOWNLOADS`. Keep
 downloader already saturates your line on a single file, and downloading two
 files at once on top of that mostly buys dropped sockets. If you see repeated
 `ConnectionResetError: Connection lost`, that product is too large.
-
-### Downloads and uploads run at the same time
-
-Downloading and uploading are gated separately, so while one video is being sent
-to you the next one is already being fetched. On most connections the upload is
-the slower leg, so this hides the download time almost entirely.
-
-`PIPELINE_DEPTH` is how many items may be in flight at once — downloading,
-waiting to upload, or uploading. At the default of `3`, downloads run up to two
-items ahead of the uploader. Uploads stay serialized, so a batch still arrives
-in order.
-
-**This is also your disk budget.** Every in-flight item holds a file, and the
-parallel downloader reserves a file's full size the moment it starts, so peak
-disk use is about `PIPELINE_DEPTH × file size` — roughly 1.8 GB for three 600 MB
-videos. Lower it to `2`, or to `1` to turn pipelining off entirely, if space is
-tight.
-
-`DISK_MIN_FREE_GB` is held in reserve. A download that would not fit waits for
-an in-flight upload to finish and release its file, and only gives up (with a
-clear message) if space never appears — rather than dying partway through a
-600 MB transfer.
-
-`BATCH_SIZE` has been replaced by `PIPELINE_DEPTH`. If your `config.env` still
-sets `BATCH_SIZE=1`, it is now ignored and no longer forces one-at-a-time
-behaviour.
 
 Optional auto-forward setting:
 

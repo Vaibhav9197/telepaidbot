@@ -8,6 +8,12 @@
 # one file across N media sessions to the same DC multiplies throughput without
 # Premium.
 #
+# That premise holds only on a link that keeps those connections alive. Where
+# connections are being reset, each reset costs a retry and more workers make
+# downloads slower -- measured at 0.44 MB/s on 4 workers against 1.31 MB/s on
+# one. Run benchmark_speed.py before trusting a DOWNLOAD_WORKERS value;
+# DOWNLOAD_WORKERS=1 skips this module entirely.
+#
 # Any failure here raises FastDownloadUnavailable so the caller can fall back to
 # Pyrogram's own downloader, which handles the cases this module deliberately
 # skips (CDN redirects, chat photos, unknown sizes).

@@ -40,8 +40,6 @@ from helpers.fastdl import (
     FastDownloadUnavailable
 )
 
-from helpers import limits
-
 # Progress bar template
 PROGRESS_BAR = """
 Percentage: {percentage:.2f}% | {current}/{total}
@@ -380,10 +378,7 @@ async def processMediaGroup(chat_message, bot, message, forward_chat_id=None):
                 download_single_media(msg, progress_message, start_time, item_path)
             )
 
-    # Album items already download in parallel among themselves; the semaphore
-    # keeps the group as a whole from overlapping another request's download.
-    async with limits.download_semaphore:
-        results = await asyncio.gather(*download_tasks, return_exceptions=True)
+    results = await asyncio.gather(*download_tasks, return_exceptions=True)
 
     for result in results:
         if isinstance(result, Exception):
@@ -404,8 +399,7 @@ async def processMediaGroup(chat_message, bot, message, forward_chat_id=None):
         try:
             for attempt in range(3):
                 try:
-                    async with limits.upload_semaphore:
-                        sent_messages = await bot.send_media_group(chat_id=message.chat.id, media=valid_media)
+                    sent_messages = await bot.send_media_group(chat_id=message.chat.id, media=valid_media)
                     await progress_message.delete()
                     break
                 except FloodWait as e:

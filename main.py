@@ -20,9 +20,6 @@ from helpers.utils import (
 
 from helpers.forward import check_forward_permission, resolve_forward_chat_id
 
-from helpers import limits
-from helpers.limits import init_limits, ensure_disk_space
-
 from helpers.files import (
     get_download_path,
     fileSizeLimit,
@@ -66,6 +63,7 @@ user = Client(
 )
 
 RUNNING_TASKS = set()
+download_semaphore = None
 forward_chat_id = None
 
 def track_task(coro):
@@ -75,20 +73,6 @@ def track_task(coro):
         RUNNING_TASKS.discard(task)
     task.add_done_callback(_remove)
     return task
-
-
-async def retire(task):
-    """Await one task and hand back its result or its exception.
-
-    Mirrors what gather(return_exceptions=True) gave the batch loops, so a single
-    bad post still only bumps the failed counter instead of aborting the range.
-    """
-    try:
-        return await task
-    except asyncio.CancelledError:
-        return asyncio.CancelledError()
-    except Exception as e:
-        return e
 
 
 @bot.on_message(filters.command("start") & filters.private)
@@ -161,10 +145,7 @@ async def cleanup_storage(_, message: Message):
 
 async def handle_download(bot: Client, message: Message, post_url: str):
     global forward_chat_id
-    # Held for the whole item, so the number of files on disk at once stays
-    # bounded no matter how many requests arrive. The download and upload legs
-    # are gated individually further down.
-    async with limits.pipeline_semaphore:
+    async with download_semaphore:
         if "?" in post_url:
             post_url = post_url.split("?", 1)[0]
 
@@ -185,12 +166,8 @@ async def handle_download(bot: Client, message: Message, post_url: str):
 
             LOGGER(__name__).info(f"Downloading media from URL: {post_url}")
 
-            # Only the large media types declare a size worth reserving disk for;
-            # photos and stickers stay at 0 and skip the space check.
-            expected_size = 0
-
             if chat_message.document or chat_message.video or chat_message.audio:
-                expected_size = (
+                file_size = (
                     chat_message.document.file_size
                     if chat_message.document
                     else chat_message.video.file_size
@@ -199,7 +176,7 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                 )
 
                 if not await fileSizeLimit(
-                    expected_size, message, "download", user.me.is_premium
+                    file_size, message, "download", user.me.is_premium
                 ):
                     return
 
@@ -237,16 +214,9 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                     message.id, filename, item_id=message_id
                 )
 
-                async with limits.download_semaphore:
-                    if not await ensure_disk_space(expected_size, message):
-                        await progress_message.delete()
-                        return
-
-                    media_path = await download_with_fallback(
-                        chat_message, download_path, progress_message, start_time
-                    )
-                # Download slot is free from here, so the next item can start
-                # fetching while this one uploads.
+                media_path = await download_with_fallback(
+                    chat_message, download_path, progress_message, start_time
+                )
 
                 if not media_path or not os.path.exists(media_path):
                     await progress_message.edit("**❌ Download failed: File not saved properly**")
@@ -269,24 +239,19 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                     if chat_message.audio
                     else "document"
                 )
-                try:
-                    async with limits.upload_semaphore:
-                        await send_media(
-                            bot,
-                            message,
-                            media_path,
-                            media_type,
-                            raw_caption,
-                            raw_caption_entities,
-                            progress_message,
-                            start_time,
-                            forward_chat_id=effective_forward_chat_id,
-                        )
-                finally:
-                    # Release the disk even when the upload fails, or a failed
-                    # send would strand the file for the rest of the run.
-                    cleanup_download(media_path)
+                await send_media(
+                    bot,
+                    message,
+                    media_path,
+                    media_type,
+                    raw_caption,
+                    raw_caption_entities,
+                    progress_message,
+                    start_time,
+                    forward_chat_id=effective_forward_chat_id,
+                )
 
+                cleanup_download(media_path)
                 await progress_message.delete()
 
             elif chat_message.poll:
@@ -351,7 +316,7 @@ async def handle_download(bot: Client, message: Message, post_url: str):
 
 async def handle_story_download(bot: Client, message: Message, story_url: str):
     global forward_chat_id
-    async with limits.pipeline_semaphore:
+    async with download_semaphore:
         if "?" in story_url:
             story_url = story_url.split("?", 1)[0]
 
@@ -420,19 +385,9 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
                 message.id, filename, item_id=story_id
             )
 
-            story_media = getattr(story, "video", None) or getattr(story, "photo", None)
-            expected_size = getattr(story_media, "file_size", 0) or 0
-
-            async with limits.download_semaphore:
-                if not await ensure_disk_space(expected_size, message):
-                    await progress_message.delete()
-                    return
-
-                media_path = await download_with_fallback(
-                    story, download_path, progress_message, start_time
-                )
-            # Download slot is free from here, so the next item can start
-            # fetching while this one uploads.
+            media_path = await download_with_fallback(
+                story, download_path, progress_message, start_time
+            )
 
             if not media_path or not os.path.exists(media_path):
                 await progress_message.edit(
@@ -451,22 +406,19 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
             )
 
             media_type = "video" if story.video else "photo"
-            try:
-                async with limits.upload_semaphore:
-                    await send_media(
-                        bot,
-                        message,
-                        media_path,
-                        media_type,
-                        raw_caption,
-                        raw_caption_entities,
-                        progress_message,
-                        start_time,
-                        forward_chat_id=effective_forward_chat_id,
-                    )
-            finally:
-                cleanup_download(media_path)
+            await send_media(
+                bot,
+                message,
+                media_path,
+                media_type,
+                raw_caption,
+                raw_caption_entities,
+                progress_message,
+                start_time,
+                forward_chat_id=effective_forward_chat_id,
+            )
 
+            cleanup_download(media_path)
             await progress_message.delete()
 
         except FloodWait as e:
@@ -562,37 +514,37 @@ async def download_story_range(bot: Client, message: Message):
 
     downloaded = failed = 0
     batch_tasks = []
-    # Keep a rolling window in flight rather than draining after every item, so
-    # the next story downloads while the previous one uploads.
-    PIPELINE_DEPTH = PyroConf.PIPELINE_DEPTH
+    BATCH_SIZE = PyroConf.BATCH_SIZE
 
     for sid in range(start_id, end_id + 1):
         url = f"{prefix}/{sid}"
         task = track_task(handle_story_download(bot, message, url))
         batch_tasks.append(task)
 
-        if len(batch_tasks) >= PIPELINE_DEPTH:
-            result = await retire(batch_tasks.pop(0))
-            if isinstance(result, asyncio.CancelledError):
-                await loading.delete()
-                return await message.reply(
-                    f"**❌ Batch canceled** after downloading `{downloaded}` stories."
-                )
-            elif isinstance(result, Exception):
-                failed += 1
-                LOGGER(__name__).error(f"Error: {result}")
-            else:
-                downloaded += 1
+        if len(batch_tasks) >= BATCH_SIZE:
+            results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, asyncio.CancelledError):
+                    await loading.delete()
+                    return await message.reply(
+                        f"**❌ Batch canceled** after downloading `{downloaded}` stories."
+                    )
+                elif isinstance(result, Exception):
+                    failed += 1
+                    LOGGER(__name__).error(f"Error: {result}")
+                else:
+                    downloaded += 1
 
+            batch_tasks.clear()
             await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
 
-    # Drain whatever is still in the window, oldest first.
-    while batch_tasks:
-        result = await retire(batch_tasks.pop(0))
-        if isinstance(result, Exception):
-            failed += 1
-        else:
-            downloaded += 1
+    if batch_tasks:
+        results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                failed += 1
+            else:
+                downloaded += 1
 
     await loading.delete()
     await message.reply(
@@ -638,9 +590,7 @@ async def download_range(bot: Client, message: Message):
     downloaded = skipped = failed = 0
     processed_media_groups = set()
     batch_tasks = []
-    # Keep a rolling window in flight rather than draining after every item, so
-    # the next post downloads while the previous one uploads.
-    PIPELINE_DEPTH = PyroConf.PIPELINE_DEPTH
+    BATCH_SIZE = PyroConf.BATCH_SIZE
 
     for msg_id in range(start_id, end_id + 1):
         url = f"{prefix}/{msg_id}"
@@ -665,32 +615,34 @@ async def download_range(bot: Client, message: Message):
             task = track_task(handle_download(bot, message, url))
             batch_tasks.append(task)
 
-            if len(batch_tasks) >= PIPELINE_DEPTH:
-                result = await retire(batch_tasks.pop(0))
-                if isinstance(result, asyncio.CancelledError):
-                    await loading.delete()
-                    return await message.reply(
-                        f"**❌ Batch canceled** after downloading `{downloaded}` posts."
-                    )
-                elif isinstance(result, Exception):
-                    failed += 1
-                    LOGGER(__name__).error(f"Error: {result}")
-                else:
-                    downloaded += 1
+            if len(batch_tasks) >= BATCH_SIZE:
+                results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, asyncio.CancelledError):
+                        await loading.delete()
+                        return await message.reply(
+                            f"**❌ Batch canceled** after downloading `{downloaded}` posts."
+                        )
+                    elif isinstance(result, Exception):
+                        failed += 1
+                        LOGGER(__name__).error(f"Error: {result}")
+                    else:
+                        downloaded += 1
 
+                batch_tasks.clear()
                 await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
 
         except Exception as e:
             failed += 1
             LOGGER(__name__).error(f"Error at {url}: {e}")
 
-    # Drain whatever is still in the window, oldest first.
-    while batch_tasks:
-        result = await retire(batch_tasks.pop(0))
-        if isinstance(result, Exception):
-            failed += 1
-        else:
-            downloaded += 1
+    if batch_tasks:
+        results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                failed += 1
+            else:
+                downloaded += 1
 
     await loading.delete()
     await message.reply(
@@ -761,8 +713,8 @@ async def cancel_all_tasks(_, message: Message):
 
 
 async def initialize():
-    global forward_chat_id
-    init_limits()
+    global download_semaphore, forward_chat_id
+    download_semaphore = asyncio.Semaphore(PyroConf.MAX_CONCURRENT_DOWNLOADS)
 
     if PyroConf.FORWARD_CHAT_ID:
         forward_chat_id = await resolve_forward_chat_id(PyroConf.FORWARD_CHAT_ID)

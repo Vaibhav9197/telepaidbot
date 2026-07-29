@@ -47,12 +47,10 @@ Before you begin, ensure you have met the following requirements:
    - **`DOWNLOAD_WORKERS`**: Parallel connections used per file (default: 8, max 16). Telegram throttles per connection rather than per account, so raising this usually increases download speed — no Premium needed. **On an unstable connection it can make things slower**, because every dropped connection costs a retry. Run `python benchmark_speed.py <url>` to measure your own line and set this to whichever row wins; `1` disables the parallel path.
    - **`MAX_CONCURRENT_TRANSMISSIONS`**: Concurrent transfers Pyrogram permits; also gates uploads back to Telegram (default: 4)
    - **`MAX_CONCURRENT_DOWNLOADS`**: Number of simultaneous downloads (default: 1)
-   - **`MAX_CONCURRENT_UPLOADS`**: Number of simultaneous uploads (default: 1). Gated separately from downloads, so the next file starts downloading while the previous one is still uploading.
-   - **`PIPELINE_DEPTH`**: Items in flight at once — downloading, waiting to upload, or uploading (default: 3, so downloads run two items ahead of the uploader). This is also the disk budget: peak use is roughly `PIPELINE_DEPTH × file size`. Set to `1` to disable pipelining.
-   - **`DISK_MIN_FREE_GB`**: Free space held in reserve (default: 2). A download that would not fit waits for an in-flight upload to release its file instead of failing mid-transfer.
-   - **`FLOOD_WAIT_DELAY`**: Delay in seconds between batch items to avoid flood limits (default: 10)
+   - **`BATCH_SIZE`**: Number of posts to process in parallel during batch downloads (default: 1)
+   - **`FLOOD_WAIT_DELAY`**: Delay in seconds between batch groups to avoid flood limits (default: 10)
 
-   If you hit FloodWait, lower `DOWNLOAD_WORKERS` first. `BATCH_SIZE` is superseded by `PIPELINE_DEPTH` and is no longer read.
+   If you hit FloodWait, lower `DOWNLOAD_WORKERS` first.
 
 ## Deploy the Bot
 
