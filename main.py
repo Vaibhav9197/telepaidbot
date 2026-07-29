@@ -7,7 +7,6 @@ import psutil
 import asyncio
 from time import time
 
-from pyleaves import Leaves
 from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
 from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait
@@ -15,7 +14,7 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from helpers.utils import (
     processMediaGroup,
-    progressArgs,
+    download_with_fallback,
     send_media
 )
 
@@ -50,7 +49,7 @@ bot = Client(
     bot_token=PyroConf.BOT_TOKEN,
     workers=100,
     parse_mode=ParseMode.MARKDOWN,
-    max_concurrent_transmissions=1, # ✅ SAFE DEFAULT
+    max_concurrent_transmissions=PyroConf.MAX_CONCURRENT_TRANSMISSIONS,
     sleep_threshold=30,
 )
 
@@ -59,7 +58,7 @@ user = Client(
     "user_session",
     workers=100,
     session_string=PyroConf.SESSION_STRING,
-    max_concurrent_transmissions=1, # ✅ SAFE DEFAULT
+    max_concurrent_transmissions=PyroConf.MAX_CONCURRENT_TRANSMISSIONS,
     sleep_threshold=30,
 )
 
@@ -213,24 +212,9 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                 filename = get_file_name(message_id, chat_message)
                 download_path = get_download_path(message.id, filename)
 
-                media_path = None
-                for attempt in range(2):
-                    try:
-                        media_path = await chat_message.download(
-                            file_name=download_path,
-                            progress=Leaves.progress_for_pyrogram,
-                            progress_args=progressArgs(
-                                "📥 Downloading Progress", progress_message, start_time
-                            ),
-                        )
-                        break
-                    except FloodWait as e:
-                        wait_s = int(getattr(e, "value", 0) or 0)
-                        LOGGER(__name__).warning(f"FloodWait while downloading media: {wait_s}s")
-                        if wait_s > 0 and attempt == 0:
-                            await asyncio.sleep(wait_s + 1)
-                            continue
-                        raise
+                media_path = await download_with_fallback(
+                    chat_message, download_path, progress_message, start_time
+                )
 
                 if not media_path or not os.path.exists(media_path):
                     await progress_message.edit("**❌ Download failed: File not saved properly**")
@@ -397,26 +381,9 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
             filename = get_story_file_name(story_id, story, chat_username)
             download_path = get_download_path(message.id, filename)
 
-            media_path = None
-            for attempt in range(2):
-                try:
-                    media_path = await story.download(
-                        file_name=download_path,
-                        progress=Leaves.progress_for_pyrogram,
-                        progress_args=progressArgs(
-                            "📥 Downloading Progress", progress_message, start_time
-                        ),
-                    )
-                    break
-                except FloodWait as e:
-                    wait_s = int(getattr(e, "value", 0) or 0)
-                    LOGGER(__name__).warning(
-                        f"FloodWait while downloading story: {wait_s}s"
-                    )
-                    if wait_s > 0 and attempt == 0:
-                        await asyncio.sleep(wait_s + 1)
-                        continue
-                    raise
+            media_path = await download_with_fallback(
+                story, download_path, progress_message, start_time
+            )
 
             if not media_path or not os.path.exists(media_path):
                 await progress_message.edit(

@@ -44,4 +44,15 @@ class PyroConf(object):
     BATCH_SIZE = int(getenv("BATCH_SIZE", "1"))
     FLOOD_WAIT_DELAY = int(getenv("FLOOD_WAIT_DELAY", "10"))
 
+    # Parallel media sessions used per file. Telegram throttles per connection,
+    # so this is the knob that actually moves download speed. 1 disables the
+    # parallel path and falls back to Pyrogram's sequential downloader.
+    DOWNLOAD_WORKERS = max(1, min(int(getenv("DOWNLOAD_WORKERS", "8")), 16))
+
+    # Concurrent transfers Pyrogram itself will allow, which also gates uploads
+    # back to Telegram.
+    MAX_CONCURRENT_TRANSMISSIONS = max(
+        1, min(int(getenv("MAX_CONCURRENT_TRANSMISSIONS", "4")), 16)
+    )
+
     FORWARD_CHAT_ID = getenv("FORWARD_CHAT_ID", "").strip() or None

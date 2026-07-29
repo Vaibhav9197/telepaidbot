@@ -22,13 +22,22 @@ from pyrogram.types import (
     Voice,
 )
 
+from config import PyroConf
+
 from helpers.files import (
     fileSizeLimit,
-    cleanup_download
+    cleanup_download,
+    get_download_path
 )
 
 from helpers.msg import (
-    get_raw_text
+    get_raw_text,
+    get_file_name
+)
+
+from helpers.fastdl import (
+    fast_download,
+    FastDownloadUnavailable
 )
 
 # Progress bar template
@@ -128,6 +137,59 @@ async def get_video_thumbnail(video_file, duration):
 # Generate progress bar for downloading/uploading
 def progressArgs(action: str, progress_message, start_time):
     return (action, progress_message, start_time, PROGRESS_BAR, "▓", "░")
+
+
+async def download_with_fallback(
+    message,
+    file_path: Optional[str],
+    progress_message,
+    start_time,
+    label: str = "📥 Downloading Progress",
+):
+    """Download media as fast as the account allows.
+
+    Tries the parallel-connection downloader first, then falls back to
+    Pyrogram's sequential one for anything it declines to handle (CDN
+    redirects, tiny files, unknown sizes) or fails on.
+    """
+    progress = Leaves.progress_for_pyrogram
+    args = progressArgs(label, progress_message, start_time)
+    client = getattr(message, "_client", None)
+
+    if client is not None and file_path and PyroConf.DOWNLOAD_WORKERS > 1:
+        try:
+            return await fast_download(
+                client,
+                message,
+                file_path,
+                workers=PyroConf.DOWNLOAD_WORKERS,
+                progress=progress,
+                progress_args=args,
+            )
+        except FastDownloadUnavailable as e:
+            LOGGER(__name__).info(f"Using sequential download instead: {e}")
+        except FloodWait as e:
+            wait_s = int(getattr(e, "value", 0) or 0)
+            LOGGER(__name__).warning(f"FloodWait during fast download: {wait_s}s")
+            if wait_s > 0:
+                await asyncio.sleep(wait_s + 1)
+
+    kwargs = {"progress": progress, "progress_args": args}
+    if file_path:
+        kwargs["file_name"] = file_path
+
+    for attempt in range(2):
+        try:
+            return await message.download(**kwargs)
+        except FloodWait as e:
+            wait_s = int(getattr(e, "value", 0) or 0)
+            LOGGER(__name__).warning(f"FloodWait while downloading media: {wait_s}s")
+            if wait_s > 0 and attempt == 0:
+                await asyncio.sleep(wait_s + 1)
+                continue
+            raise
+
+    return None
 
 
 async def send_media(
@@ -247,37 +309,33 @@ async def send_media(
                 break
 
 
-async def download_single_media(msg, progress_message, start_time):
-    for attempt in range(2):
-        try:
-            media_path = await msg.download(
-                progress=Leaves.progress_for_pyrogram,
-                progress_args=progressArgs(
-                    "📥 Downloading Progress", progress_message, start_time
-                ),
-            )
+async def download_single_media(msg, progress_message, start_time, file_path=None):
+    try:
+        media_path = await download_with_fallback(
+            msg, file_path, progress_message, start_time
+        )
 
-            raw_cap, raw_ents = get_raw_text(msg.caption, msg.caption_entities)
-
-            if msg.photo:
-                return ("success", media_path, InputMediaPhoto(media=media_path, caption=raw_cap, caption_entities=raw_ents or None))
-            if msg.video:
-                return ("success", media_path, InputMediaVideo(media=media_path, caption=raw_cap, caption_entities=raw_ents or None))
-            if msg.document:
-                return ("success", media_path, InputMediaDocument(media=media_path, caption=raw_cap, caption_entities=raw_ents or None))
-            if msg.audio:
-                return ("success", media_path, InputMediaAudio(media=media_path, caption=raw_cap, caption_entities=raw_ents or None))
-
-        except FloodWait as e:
-            wait_s = int(getattr(e, "value", 0) or 0)
-            LOGGER(__name__).warning(f"FloodWait while downloading media: {wait_s}s")
-            if wait_s > 0 and attempt == 0:
-                await asyncio.sleep(wait_s + 1)
-                continue
+        if not media_path:
             return ("error", None, None)
-        except Exception as e:
-            LOGGER(__name__).info(f"Error downloading media: {e}")
-            return ("error", None, None)
+
+        raw_cap, raw_ents = get_raw_text(msg.caption, msg.caption_entities)
+
+        if msg.photo:
+            return ("success", media_path, InputMediaPhoto(media=media_path, caption=raw_cap, caption_entities=raw_ents or None))
+        if msg.video:
+            return ("success", media_path, InputMediaVideo(media=media_path, caption=raw_cap, caption_entities=raw_ents or None))
+        if msg.document:
+            return ("success", media_path, InputMediaDocument(media=media_path, caption=raw_cap, caption_entities=raw_ents or None))
+        if msg.audio:
+            return ("success", media_path, InputMediaAudio(media=media_path, caption=raw_cap, caption_entities=raw_ents or None))
+
+    except FloodWait as e:
+        wait_s = int(getattr(e, "value", 0) or 0)
+        LOGGER(__name__).warning(f"FloodWait while downloading media: {wait_s}s")
+        return ("error", None, None)
+    except Exception as e:
+        LOGGER(__name__).info(f"Error downloading media: {e}")
+        return ("error", None, None)
 
     return ("skip", None, None)
 
@@ -297,7 +355,12 @@ async def processMediaGroup(chat_message, bot, message, forward_chat_id=None):
     download_tasks = []
     for msg in media_group_messages:
         if msg.photo or msg.video or msg.document or msg.audio:
-            download_tasks.append(download_single_media(msg, progress_message, start_time))
+            # An explicit path is what lets the parallel downloader take over;
+            # without one it can't place the chunks itself.
+            item_path = get_download_path(message.id, get_file_name(msg.id, msg))
+            download_tasks.append(
+                download_single_media(msg, progress_message, start_time, item_path)
+            )
 
     results = await asyncio.gather(*download_tasks, return_exceptions=True)
 

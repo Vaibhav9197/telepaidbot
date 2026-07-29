@@ -31,12 +31,32 @@ Open `config.env` and replace the placeholders:
 - `BOT_TOKEN`
 - `SESSION_STRING`
 
-Recommended safe defaults to avoid FloodWait:
+Speed settings:
 
 ```env
-MAX_CONCURRENT_DOWNLOADS=1
-BATCH_SIZE=1
-FLOOD_WAIT_DELAY=10
+DOWNLOAD_WORKERS=8
+MAX_CONCURRENT_TRANSMISSIONS=4
+```
+
+`DOWNLOAD_WORKERS` is the one that matters. Telegram throttles download speed
+**per connection**, not per account, so the bot splits each file across this many
+parallel connections to the same datacenter and reassembles it locally. This is
+why official Telegram apps feel fast, and it needs no Premium subscription.
+
+- `8` — good balance, typically several times faster than a single connection
+- `12`–`16` — faster still, but more likely to draw a FloodWait
+- `1` — disables parallel downloads (original sequential behaviour)
+
+Files under 2 MB and any file Telegram serves via a CDN redirect automatically
+use the normal single-connection path, as does anything the parallel path fails
+on, so a bad setting degrades speed rather than breaking downloads.
+
+Concurrency settings, which trade FloodWait risk for batch throughput:
+
+```env
+MAX_CONCURRENT_DOWNLOADS=2
+BATCH_SIZE=2
+FLOOD_WAIT_DELAY=5
 ````
 
 Optional auto-forward setting:
@@ -153,9 +173,9 @@ Telegram will ask you to wait (e.g., “wait 2500 seconds”).
 - Restart
 
 **Prevent it:**
-- Keep `MAX_CONCURRENT_DOWNLOADS=1`
-- Keep `BATCH_SIZE=1`
-- Keep `FLOOD_WAIT_DELAY=10`
+- Lower `DOWNLOAD_WORKERS` (try `4`, then `1` to rule it out as the cause)
+- Set `MAX_CONCURRENT_DOWNLOADS=1` and `BATCH_SIZE=1`
+- Raise `FLOOD_WAIT_DELAY` back to `10`
 - Run smaller ranges (e.g., 1–300, then 301–600)
 
 ---
