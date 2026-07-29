@@ -260,9 +260,10 @@ async def fast_download(
 
     sessions = await open_sessions(client, file_id.dc_id, workers)
 
+    started = monotonic()
     next_chunk = 0
     downloaded = 0
-    last_report = monotonic()
+    last_report = started
     chunk_lock = asyncio.Lock()
 
     async def report(force: bool = False) -> None:
@@ -319,8 +320,11 @@ async def fast_download(
         await finalize(temp_path, file_path)
         await report(force=True)
 
+        elapsed = max(monotonic() - started, 1e-6)
         LOGGER(__name__).info(
-            f"Fast download finished over {workers} connections: {file_path}"
+            f"Fast download finished: {file_size / (1024 * 1024):.1f} MB over "
+            f"{workers} connections in {elapsed:.1f}s = "
+            f"{file_size / elapsed / (1024 * 1024):.2f} MB/s ({file_path})"
         )
         return file_path
 

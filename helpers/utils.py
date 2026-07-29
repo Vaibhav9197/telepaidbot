@@ -3,7 +3,7 @@
 
 import os
 import asyncio
-from time import time
+from time import time, monotonic
 from PIL import Image
 from logger import LOGGER
 from typing import Optional
@@ -182,7 +182,20 @@ async def download_with_fallback(
 
     for attempt in range(2):
         try:
-            return await message.download(**kwargs)
+            started = monotonic()
+            result = await message.download(**kwargs)
+
+            # Log the sequential path's throughput too, so the two are directly
+            # comparable when tuning DOWNLOAD_WORKERS.
+            if result and os.path.exists(result):
+                size = os.path.getsize(result)
+                elapsed = max(monotonic() - started, 1e-6)
+                LOGGER(__name__).info(
+                    f"Sequential download finished: {size / (1024 * 1024):.1f} MB "
+                    f"in {elapsed:.1f}s = "
+                    f"{size / elapsed / (1024 * 1024):.2f} MB/s"
+                )
+            return result
         except FloodWait as e:
             wait_s = int(getattr(e, "value", 0) or 0)
             LOGGER(__name__).warning(f"FloodWait while downloading media: {wait_s}s")
