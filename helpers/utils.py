@@ -282,9 +282,15 @@ async def send_media(
 
     cur_cap = caption or ""
     cur_ents = caption_entities or []
+    upload_started = monotonic()
     for attempt in range(2):
         try:
             await _send_once(cur_cap, cur_ents)
+            elapsed = max(monotonic() - upload_started, 1e-6)
+            LOGGER(__name__).info(
+                f"Upload finished: {file_size / (1024 * 1024):.1f} MB in "
+                f"{elapsed:.1f}s = {file_size / elapsed / (1024 * 1024):.2f} MB/s"
+            )
             break
         except FloodWait as e:
             wait_s = int(getattr(e, "value", 0) or 0)
