@@ -2,6 +2,7 @@
 # Channel: https://t.me/itsSmartDev
 
 import os
+import errno
 import asyncio
 from time import time, monotonic
 from PIL import Image
@@ -41,6 +42,55 @@ from helpers.fastdl import (
 )
 
 from helpers import limits
+
+# How many times to restart a download the network killed off. A flapping link
+# can stay down for a minute or two, so wait a little longer after each attempt
+# rather than burning all three retries inside the same outage.
+DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_RETRY_DELAY = 10
+
+# Windows reports a dropped link through several distinct codes, and the
+# exception class alone does not separate them from a disk problem: 64 and 10054
+# arrive as ConnectionResetError, but 1231/1232 (network unreachable) come
+# through as a bare OSError, exactly like a full disk would. Match on the code so
+# a genuine write failure is not retried three times and then blamed on the WiFi.
+NETWORK_WINERRORS = frozenset({64, 121, 1231, 1232})
+NETWORK_ERRNOS = frozenset(
+    code
+    for code in (
+        getattr(errno, name, None)
+        for name in (
+            "ECONNRESET",
+            "ECONNABORTED",
+            "ECONNREFUSED",
+            "EPIPE",
+            "ENETDOWN",
+            "ENETRESET",
+            "ENETUNREACH",
+            "EHOSTUNREACH",
+            "ETIMEDOUT",
+        )
+    )
+    if code is not None
+)
+
+
+def is_connection_error(e: BaseException) -> bool:
+    """Whether this exception is the link dropping rather than a real failure.
+
+    Pyrogram gives up on a stalled request with a bare TimeoutError, which says
+    nothing about the cause, so treat that as transient too -- the request had
+    already been retried ten times underneath before it surfaced.
+    """
+    if isinstance(e, (ConnectionError, asyncio.TimeoutError)):
+        return True
+    if isinstance(e, OSError):
+        return (
+            getattr(e, "winerror", None) in NETWORK_WINERRORS
+            or e.errno in NETWORK_ERRNOS
+        )
+    return False
+
 
 # Progress bar template
 PROGRESS_BAR = """
@@ -175,12 +225,24 @@ async def download_with_fallback(
             LOGGER(__name__).warning(f"FloodWait during fast download: {wait_s}s")
             if wait_s > 0:
                 await asyncio.sleep(wait_s + 1)
+        except (OSError, asyncio.TimeoutError) as e:
+            # fast_download turns its own failures into FastDownloadUnavailable,
+            # but opening the media sessions happens before that guard, so a link
+            # that is down at that moment escapes raw. Falling through costs one
+            # sequential attempt; letting it out skips the fallback altogether.
+            if not is_connection_error(e):
+                raise
+            LOGGER(__name__).warning(
+                f"Parallel download could not start ({type(e).__name__}: {e}); "
+                "using sequential download instead"
+            )
 
     kwargs = {"progress": progress, "progress_args": args}
     if file_path:
         kwargs["file_name"] = file_path
 
-    for attempt in range(2):
+    for attempt in range(DOWNLOAD_ATTEMPTS):
+        last = attempt == DOWNLOAD_ATTEMPTS - 1
         try:
             started = monotonic()
             result = await message.download(**kwargs)
@@ -199,10 +261,24 @@ async def download_with_fallback(
         except FloodWait as e:
             wait_s = int(getattr(e, "value", 0) or 0)
             LOGGER(__name__).warning(f"FloodWait while downloading media: {wait_s}s")
-            if wait_s > 0 and attempt == 0:
+            if wait_s > 0 and not last:
                 await asyncio.sleep(wait_s + 1)
                 continue
             raise
+        except (OSError, asyncio.TimeoutError) as e:
+            # Pyrogram has already exhausted its own retries by this point, so a
+            # link that flaps for a couple of minutes takes the whole file down
+            # with it. Every byte has to come again from offset zero, but that
+            # still beats reporting a failure the user has to re-queue by hand.
+            if last or not is_connection_error(e):
+                raise
+            LOGGER(__name__).warning(
+                f"Connection lost while downloading ({type(e).__name__}: {e}); "
+                f"restarting download in {DOWNLOAD_RETRY_DELAY * (attempt + 1)}s "
+                f"(attempt {attempt + 2} of {DOWNLOAD_ATTEMPTS})"
+            )
+            await asyncio.sleep(DOWNLOAD_RETRY_DELAY * (attempt + 1))
+            continue
 
     return None
 
