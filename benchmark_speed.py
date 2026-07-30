@@ -45,6 +45,28 @@ from pyrogram.file_id import FileId
 
 MB = 1024 * 1024
 
+# Below this the run measures connection setup rather than throughput. Each
+# worker holds one 1 MiB chunk at a time, so a 7 MB file gives eight workers a
+# single round trip each -- enough for latency jitter to reorder the whole table
+# between runs, which is exactly how a 1-worker setting got justified once.
+MIN_USEFUL_SAMPLE_MB = 32
+
+
+async def shutdown(client) -> None:
+    """Stop a client and let its sockets finish closing.
+
+    Client.stop() asks the transports to close but does not wait for it. On
+    Windows the proactor finishes the job on a later tick, so with nothing left
+    to run the loop shuts first and the sockets are finalised against a closed
+    loop -- printing a RuntimeError traceback after the results, which looks
+    like the benchmark crashed when it had already succeeded.
+    """
+    try:
+        await client.stop()
+    except Exception as e:
+        print(f"(client did not stop cleanly: {type(e).__name__}: {e})")
+    await asyncio.sleep(0.5)
+
 
 async def measure(client, message, workers, sample_bytes):
     """Fetch `sample_bytes` using `workers` connections; return MB/s."""
@@ -146,7 +168,7 @@ async def run_upload_benchmark(sample_mb):
         except Exception as e:
             print(f"{label:>8}  {'ERROR':>8}  {type(e).__name__}: {e}")
         finally:
-            await client.stop()
+            await shutdown(client)
 
     print()
     print("Uploads use ONE connection and 512 KB parts, so unlike downloads")
@@ -204,6 +226,24 @@ async def main():
 
         print(f"File: {media.file_size / MB:.1f} MB "
               f"on DC{FileId.decode(media.file_id).dc_id}\n")
+
+        # How much will actually be fetched, which is not what was asked for
+        # when the file is smaller than the sample.
+        actual_mb = min(sample_mb * MB, media.file_size) / MB
+        if actual_mb < MIN_USEFUL_SAMPLE_MB:
+            chunks = max(1, int(actual_mb))
+            print(f"⚠  This file is too small to measure. Only {actual_mb:.0f} MB "
+                  f"({chunks} chunk{'s' if chunks != 1 else ''}) will be fetched\n"
+                  f"   per run, so the highest worker counts get one round trip "
+                  f"each and the\n"
+                  f"   numbers below are mostly connection setup and latency "
+                  f"jitter -- they will\n"
+                  f"   disagree from run to run and should not be used to pick "
+                  f"DOWNLOAD_WORKERS.\n\n"
+                  f"   Point this at a post of at least "
+                  f"{MIN_USEFUL_SAMPLE_MB * len(worker_counts)} MB and pass "
+                  f"--mb {MIN_USEFUL_SAMPLE_MB} or more.\n")
+
         print(f"{'workers':>8}  {'MB/s':>8}  {'vs 1 conn':>10}  "
               f"{'resets':>7}  {'floods':>7}  detail")
         print("-" * 72)
@@ -240,7 +280,7 @@ async def main():
         print("connection being reset repeatedly is a network problem no setting")
         print("in this bot can fix. Retrying it is what costs the throughput.")
     finally:
-        await user.stop()
+        await shutdown(user)
 
     return 0
 
