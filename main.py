@@ -15,7 +15,8 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from helpers.utils import (
     processMediaGroup,
     download_with_fallback,
-    send_media
+    send_media,
+    is_connection_error
 )
 
 from helpers.forward import check_forward_permission, resolve_forward_chat_id
@@ -159,6 +160,22 @@ async def cleanup_storage(_, message: Message):
         return await message.reply("❌ **Cleanup failed.** Check logs for details.")
 
 
+async def discard_progress(progress_message):
+    """Remove the progress stub when an error reply is taking its place.
+
+    Every handler below reports failures with its own message, so a leftover
+    "Downloading..." reads as an item still in flight long after it was
+    abandoned. Best-effort by design: the stub may already be gone, and losing
+    it is never worth failing the item over.
+    """
+    if progress_message is None:
+        return
+    try:
+        await progress_message.delete()
+    except Exception as e:
+        LOGGER(__name__).warning(f"Could not remove progress message: {e}")
+
+
 async def handle_download(bot: Client, message: Message, post_url: str):
     global forward_chat_id
     # Held for the whole item, so the number of files on disk stays bounded no
@@ -167,6 +184,10 @@ async def handle_download(bot: Client, message: Message, post_url: str):
     async with limits.pipeline_semaphore:
         if "?" in post_url:
             post_url = post_url.split("?", 1)[0]
+
+        # Bound before the try so the error handlers can clear it no matter how
+        # far in the failure landed -- most of them fire before it even exists.
+        progress_message = None
 
         try:
             effective_forward_chat_id = None
@@ -321,11 +342,13 @@ async def handle_download(bot: Client, message: Message, post_url: str):
         except FloodWait as e:
             wait_s = int(getattr(e, "value", 0) or 0)
             LOGGER(__name__).warning(f"FloodWait in handle_download: {wait_s}s")
+            await discard_progress(progress_message)
             if wait_s > 0:
                 await asyncio.sleep(wait_s + 1)
             return
         except PeerIdInvalid as e:
             LOGGER(__name__).error(f"PeerIdInvalid for {post_url}: {e}")
+            await discard_progress(progress_message)
             await message.reply(
                 "**❌ Access Denied**\n\n"
                 "The user client cannot access this chat.\n"
@@ -334,6 +357,7 @@ async def handle_download(bot: Client, message: Message, post_url: str):
             )
         except BadRequest as e:
             LOGGER(__name__).error(f"BadRequest for {post_url}: {e}")
+            await discard_progress(progress_message)
             await message.reply(
                 "**❌ Bad Request**\n\n"
                 f"Telegram returned an error: `{e}`\n\n"
@@ -341,12 +365,26 @@ async def handle_download(bot: Client, message: Message, post_url: str):
             )
         except KeyError as e:
             LOGGER(__name__).error(f"KeyError for {post_url}: {e}")
+            await discard_progress(progress_message)
             await message.reply(f"**❌ Invalid URL format:** `{e}`")
         except ValueError as e:
             LOGGER(__name__).warning(f"Invalid post URL {post_url}: {e}")
+            await discard_progress(progress_message)
             await message.reply(f"**❌ {e}**")
+        except (OSError, asyncio.TimeoutError) as e:
+            if not is_connection_error(e):
+                raise
+            LOGGER(__name__).error(f"Connection lost for {post_url}: {e}")
+            await discard_progress(progress_message)
+            await message.reply(
+                "**❌ Network connection lost**\n\n"
+                "The download was retried and the link kept dropping. "
+                "Send the same URL again once the connection is stable.\n\n"
+                f"**Details:** `{type(e).__name__}: {e}`"
+            )
         except Exception as e:
             LOGGER(__name__).error(f"Unexpected error for {post_url}: {e}")
+            await discard_progress(progress_message)
             await message.reply("**❌ An unexpected error occurred.** Check /logs for details.")
 
 
@@ -355,6 +393,8 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
     async with limits.pipeline_semaphore:
         if "?" in story_url:
             story_url = story_url.split("?", 1)[0]
+
+        progress_message = None
 
         try:
             effective_forward_chat_id = None
@@ -473,11 +513,13 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
         except FloodWait as e:
             wait_s = int(getattr(e, "value", 0) or 0)
             LOGGER(__name__).warning(f"FloodWait in handle_story_download: {wait_s}s")
+            await discard_progress(progress_message)
             if wait_s > 0:
                 await asyncio.sleep(wait_s + 1)
             return
         except PeerIdInvalid as e:
             LOGGER(__name__).error(f"PeerIdInvalid for story {story_url}: {e}")
+            await discard_progress(progress_message)
             await message.reply(
                 "**❌ Access Denied**\n\n"
                 "The user client cannot resolve this user/channel.\n"
@@ -486,15 +528,29 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
             )
         except BadRequest as e:
             LOGGER(__name__).error(f"BadRequest for story {story_url}: {e}")
+            await discard_progress(progress_message)
             await message.reply(
                 "**❌ Bad Request**\n\n"
                 f"Telegram returned an error: `{e}`\n\n"
                 "The story may have expired, been deleted, or the ID is invalid."
             )
         except ValueError as e:
+            await discard_progress(progress_message)
             await message.reply(f"**❌ Invalid story URL:** `{e}`")
+        except (OSError, asyncio.TimeoutError) as e:
+            if not is_connection_error(e):
+                raise
+            LOGGER(__name__).error(f"Connection lost for story {story_url}: {e}")
+            await discard_progress(progress_message)
+            await message.reply(
+                "**❌ Network connection lost**\n\n"
+                "The download was retried and the link kept dropping. "
+                "Send the same URL again once the connection is stable.\n\n"
+                f"**Details:** `{type(e).__name__}: {e}`"
+            )
         except Exception as e:
             LOGGER(__name__).error(f"Unexpected error for story {story_url}: {e}")
+            await discard_progress(progress_message)
             await message.reply("**❌ An unexpected error occurred.** Check /logs for details.")
 
 
