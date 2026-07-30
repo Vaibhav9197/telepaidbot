@@ -17,6 +17,57 @@ SIZE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
 DOWNLOADS_ROOT = PyroConf.DOWNLOAD_DIR
 
 
+# Characters Windows refuses outright in a filename, plus the control range.
+# Uploaders put all of these in file names, and Telegram passes them through
+# verbatim, so whatever arrives has to be treated as untrusted text rather than
+# as a usable path component.
+ILLEGAL_CHARS = '<>:"/\\|?*'
+
+# Device names that are still special no matter the extension: opening CON.mp4
+# talks to the console, not to a file.
+RESERVED_NAMES = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+# Leaves room for the staging root and the two id folders under MAX_PATH.
+MAX_NAME_LEN = 120
+
+
+def sanitize_filename(name: str, fallback: str) -> str:
+    """Turn a Telegram file name into one Windows can actually address.
+
+    A trailing space is the case that matters most, because it fails so quietly:
+    Windows strips it while resolving a path, so the file gets created under a
+    name that no longer matches the one being asked for, and the rename at the
+    end of the download comes back as "the parameter is incorrect" -- after the
+    whole file has been fetched. One post whose name ended in a space cost about
+    nine minutes per attempt and left nothing behind.
+    """
+    name = os.path.basename(name or "")
+
+    cleaned = "".join(
+        "_" if ch in ILLEGAL_CHARS or ord(ch) < 32 else ch for ch in name
+    )
+
+    # Trailing dots and spaces are unaddressable, and stripping has to happen
+    # after the extension is considered or "file .mp4" would lose nothing while
+    # "file. " would lose everything.
+    stem, ext = os.path.splitext(cleaned)
+    stem = stem.rstrip(". ").lstrip()
+    ext = ext.rstrip(". ")
+
+    if stem.upper() in RESERVED_NAMES:
+        stem = f"_{stem}"
+
+    if len(stem) > MAX_NAME_LEN:
+        stem = stem[:MAX_NAME_LEN].rstrip(". ")
+
+    result = f"{stem}{ext}" if stem else ""
+    return result or fallback
+
+
 def get_download_path(
     folder_id: int,
     filename: str,
@@ -24,9 +75,7 @@ def get_download_path(
     item_id=None,
 ) -> str:
     root_dir = root_dir or DOWNLOADS_ROOT
-    safe_name = os.path.basename(filename)
-    if not safe_name:
-        safe_name = str(folder_id)
+    safe_name = sanitize_filename(filename, fallback=str(item_id or folder_id))
     folder = os.path.join(root_dir, str(folder_id))
     # Telegram hands out the same file_name for every clip recorded in the same
     # second, so two posts in one batch routinely collide. Give each item its own
@@ -42,14 +91,34 @@ def get_download_path(
     return full_path
 
 
+def force_remove(path: str) -> bool:
+    """Delete a file, including one Windows cannot address by its own name.
+
+    Files created before names were sanitized can end in a space, and Win32
+    strips that while resolving a path -- so os.remove reports the file as
+    missing while it sits there taking up space and blocking its folder. The
+    \\?\\ prefix skips that normalisation. It must be joined to the raw path:
+    abspath would strip the trailing space before the prefix could protect it.
+    """
+    for candidate in (path, "\\\\?\\" + path if os.path.isabs(path) else None):
+        if candidate is None:
+            continue
+        try:
+            os.remove(candidate)
+            return True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+    return False
+
+
 def cleanup_download(path: str) -> None:
     try:
         LOGGER(__name__).info(f"Cleaning Download: {path}")
-        
-        if os.path.exists(path):
-            os.remove(path)
-        if os.path.exists(path + ".temp"):
-            os.remove(path + ".temp")
+
+        force_remove(path)
+        force_remove(path + ".temp")
 
         # Walk back up the per-item and per-request folders, pruning whatever is
         # left empty, but never past the downloads root itself.
@@ -72,13 +141,25 @@ def cleanup_downloads_root(root_dir: Optional[str] = None) -> tuple[int, int]:
 
     file_count = 0
     total_size = 0
-    for dirpath, _, filenames in os.walk(root_dir):
+
+    # Delete bottom-up rather than handing the whole tree to rmtree. rmtree
+    # cannot open a file whose name ends in a space, and with ignore_errors it
+    # says nothing -- so /cleanup would report success while leaving both the
+    # file and every folder above it in place.
+    for dirpath, _, filenames in os.walk(root_dir, topdown=False):
         for name in filenames:
-            file_count += 1
+            path = os.path.join(dirpath, name)
             try:
-                total_size += os.path.getsize(os.path.join(dirpath, name))
+                total_size += os.path.getsize(path)
             except OSError:
                 pass
+            if force_remove(path):
+                file_count += 1
+
+        try:
+            os.rmdir(dirpath)
+        except OSError:
+            pass
 
     shutil.rmtree(root_dir, ignore_errors=True)
     return file_count, total_size

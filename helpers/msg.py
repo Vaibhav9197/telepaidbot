@@ -1,6 +1,7 @@
 # Copyright (C) @TheSmartBisnu
 # Channel: https://t.me/itsSmartDev
 
+import os
 import re
 
 from pyrogram.utils import get_channel_id
@@ -82,19 +83,39 @@ def getChatMsgID(link: str):
     return chat_id, message_id
 
 
+def with_extension(name: str, fallback: str, ext: str) -> str:
+    """Use the uploader's name, but never without an extension.
+
+    Telegram is happy to serve a video called "Vid Id" with no suffix at all.
+    ffmpeg picks its demuxer from the extension when generating the thumbnail,
+    so an extensionless file silently loses its preview -- and the player has to
+    guess too. Falling back entirely would throw away a name the user recognises,
+    so only the missing part is supplied.
+    """
+    if not name or not name.strip():
+        return fallback
+    return name if os.path.splitext(name)[1] else f"{name}{ext}"
+
+
 def get_file_name(message_id: int, chat_message) -> str:
     if chat_message.document:
-        return chat_message.document.file_name
+        return chat_message.document.file_name or f"{message_id}"
     elif chat_message.video:
-        return chat_message.video.file_name or f"{message_id}.mp4"
+        return with_extension(
+            chat_message.video.file_name, f"{message_id}.mp4", ".mp4"
+        )
     elif chat_message.audio:
-        return chat_message.audio.file_name or f"{message_id}.mp3"
+        return with_extension(
+            chat_message.audio.file_name, f"{message_id}.mp3", ".mp3"
+        )
     elif chat_message.voice:
         return f"{message_id}.ogg"
     elif chat_message.video_note:
         return f"{message_id}.mp4"
     elif chat_message.animation:
-        return chat_message.animation.file_name or f"{message_id}.gif"
+        return with_extension(
+            chat_message.animation.file_name, f"{message_id}.gif", ".gif"
+        )
     elif chat_message.sticker:
         if chat_message.sticker.is_animated:
             return f"{message_id}.tgs"
