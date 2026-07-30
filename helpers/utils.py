@@ -4,6 +4,7 @@
 import os
 import errno
 import asyncio
+import urllib.request
 from time import time, monotonic
 from PIL import Image
 from logger import LOGGER
@@ -73,6 +74,20 @@ NETWORK_ERRNOS = frozenset(
     )
     if code is not None
 )
+
+
+# Throughput of the most recent transfer on each leg, so /speed can compare what
+# the bot actually achieved against what the line is capable of. Without that
+# comparison a number like "1.31 MB/s" reads as a bot problem, when on a 10 Mbps
+# line it is the whole connection and no setting can improve on it.
+LAST_SPEED = {"download": None, "upload": None}
+
+
+def record_speed(leg: str, size_bytes: int, elapsed: float) -> float:
+    """Store and return MB/s for a finished transfer."""
+    mbps = size_bytes / max(elapsed, 1e-6) / (1024 * 1024)
+    LAST_SPEED[leg] = mbps
+    return mbps
 
 
 def is_connection_error(e: BaseException) -> bool:
@@ -191,6 +206,133 @@ def progressArgs(action: str, progress_message, start_time):
     return (action, progress_message, start_time, PROGRESS_BAR, "▓", "░")
 
 
+# Neutral endpoints for measuring the line itself. Deliberately not Telegram:
+# the point is to establish what the connection can do at all, so that a slow
+# transfer can be attributed to the line rather than to the bot or to Telegram.
+SPEEDTEST_DOWN_URL = "https://speed.cloudflare.com/__down?bytes={bytes}"
+SPEEDTEST_UP_URL = "https://speed.cloudflare.com/__up"
+SPEEDTEST_DOWN_BYTES = 8 * 1024 * 1024
+SPEEDTEST_UP_BYTES = 3 * 1024 * 1024
+SPEEDTEST_TIMEOUT = 90
+
+
+def _http_speedtest(url: str, payload: Optional[bytes] = None) -> float:
+    """Blocking transfer against a neutral host; returns MB/s. Runs off-loop."""
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        # Cloudflare refuses the default urllib agent outright.
+        headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/octet-stream"},
+        method="POST" if payload is not None else "GET",
+    )
+    moved = len(payload) if payload is not None else 0
+    started = monotonic()
+    with urllib.request.urlopen(req, timeout=SPEEDTEST_TIMEOUT) as resp:
+        while payload is None:
+            block = resp.read(65536)
+            if not block:
+                break
+            moved += len(block)
+        if payload is not None:
+            resp.read()
+    return moved / max(monotonic() - started, 1e-6) / (1024 * 1024)
+
+
+async def measure_line_capacity() -> dict:
+    """Measure what the connection itself can do, in both directions.
+
+    urllib is blocking, so each leg goes to a thread rather than stalling the
+    event loop and starving whatever transfer is already running.
+    """
+    result = {"down": None, "up": None}
+    try:
+        result["down"] = await asyncio.to_thread(
+            _http_speedtest, SPEEDTEST_DOWN_URL.format(bytes=SPEEDTEST_DOWN_BYTES)
+        )
+    except Exception as e:
+        LOGGER(__name__).warning(f"Download capacity probe failed: {e}")
+    try:
+        result["up"] = await asyncio.to_thread(
+            _http_speedtest, SPEEDTEST_UP_URL, b"\0" * SPEEDTEST_UP_BYTES
+        )
+    except Exception as e:
+        LOGGER(__name__).warning(f"Upload capacity probe failed: {e}")
+    return result
+
+
+def is_copyable(chat_message) -> bool:
+    """Whether Telegram will let this post be copied between chats.
+
+    Protection is set per message and per chat, and either one blocks a copy, so
+    both have to be clear. Both attributes are optional in the schema and absent
+    means "not protected", which is why this reads them defensively rather than
+    trusting them to be present.
+    """
+    if getattr(chat_message, "has_protected_content", False):
+        return False
+    chat = getattr(chat_message, "chat", None)
+    return not getattr(chat, "has_protected_content", False)
+
+
+async def try_server_side_copy(user, bot, chat_message, forward_chat_id=None) -> bool:
+    """Let Telegram move the post between chats instead of routing it through here.
+
+    Downloading and re-uploading sends every byte over the local link twice. On a
+    slow connection that is minutes per file, and it is pure waste whenever the
+    source allows forwarding: Telegram can copy the post server-side, so the
+    bytes never leave its infrastructure and the transfer is effectively instant.
+
+    Only the user session can see the source chat, so it is the one that copies.
+    That means the post arrives under the account's own name rather than the
+    bot's -- the one visible difference, and the reason SERVER_SIDE_COPY exists.
+
+    Returns True if the post was delivered. Anything that says otherwise returns
+    False, and the caller falls back to the download path having sent nothing.
+    """
+    bot_id = getattr(getattr(bot, "me", None), "id", None)
+    if bot_id is None:
+        return False
+
+    is_album = bool(chat_message.media_group_id)
+    copy = user.copy_media_group if is_album else user.copy_message
+
+    # The forward chat goes first, deliberately. It is the copy most likely to be
+    # refused -- the account may not be a member -- and finding that out before
+    # anything has been delivered is what lets us fall back cleanly. Reversed, a
+    # refusal here would mean re-downloading a post the user already has.
+    targets = ([forward_chat_id] if forward_chat_id else []) + [bot_id]
+    delivered = False
+
+    for target in targets:
+        try:
+            await copy(
+                chat_id=target,
+                from_chat_id=chat_message.chat.id,
+                message_id=chat_message.id,
+            )
+            delivered = True
+        except FloodWait as e:
+            wait_s = int(getattr(e, "value", 0) or 0)
+            LOGGER(__name__).warning(f"FloodWait during server-side copy: {wait_s}s")
+            if not delivered:
+                return False
+        except Exception as e:
+            # ChatForwardsRestricted and friends are only decidable by the server,
+            # so a refusal here is expected rather than exceptional.
+            LOGGER(__name__).info(
+                f"Server-side copy to {target} refused ({type(e).__name__}: {e})"
+            )
+            if not delivered:
+                return False
+
+    if delivered:
+        LOGGER(__name__).info(
+            f"Copied {'album' if is_album else 'post'} server-side from "
+            f"{chat_message.chat.id}/{chat_message.id} -- no bytes transferred locally"
+        )
+    return delivered
+
+
 async def download_with_fallback(
     message,
     file_path: Optional[str],
@@ -210,7 +352,8 @@ async def download_with_fallback(
 
     if client is not None and file_path and PyroConf.DOWNLOAD_WORKERS > 1:
         try:
-            return await fast_download(
+            started = monotonic()
+            result = await fast_download(
                 client,
                 message,
                 file_path,
@@ -218,6 +361,13 @@ async def download_with_fallback(
                 progress=progress,
                 progress_args=args,
             )
+            # fastdl logs its own throughput but cannot record it here without
+            # importing this module back, so the timing is repeated on this side.
+            if result and os.path.exists(result):
+                record_speed(
+                    "download", os.path.getsize(result), monotonic() - started
+                )
+            return result
         except FastDownloadUnavailable as e:
             LOGGER(__name__).info(f"Using sequential download instead: {e}")
         except FloodWait as e:
@@ -252,10 +402,10 @@ async def download_with_fallback(
             if result and os.path.exists(result):
                 size = os.path.getsize(result)
                 elapsed = max(monotonic() - started, 1e-6)
+                mbps = record_speed("download", size, elapsed)
                 LOGGER(__name__).info(
                     f"Sequential download finished: {size / (1024 * 1024):.1f} MB "
-                    f"in {elapsed:.1f}s = "
-                    f"{size / elapsed / (1024 * 1024):.2f} MB/s"
+                    f"in {elapsed:.1f}s = {mbps:.2f} MB/s"
                 )
             return result
         except FloodWait as e:
@@ -365,9 +515,10 @@ async def send_media(
         try:
             await _send_once(cur_cap, cur_ents)
             elapsed = max(monotonic() - upload_started, 1e-6)
+            mbps = record_speed("upload", file_size, elapsed)
             LOGGER(__name__).info(
                 f"Upload finished: {file_size / (1024 * 1024):.1f} MB in "
-                f"{elapsed:.1f}s = {file_size / elapsed / (1024 * 1024):.2f} MB/s"
+                f"{elapsed:.1f}s = {mbps:.2f} MB/s"
             )
             break
         except FloodWait as e:

@@ -14,6 +14,7 @@ Everything you can send the bot in Telegram.
 | [`/dls <url>`](#dls-url) | Download one story |
 | [`/bdls <start> <end>`](#bdls-start_url-end_url) | Download a range of stories |
 | [`/stats`](#stats) | Uptime, disk, memory, CPU, network totals |
+| [`/speed`](#speed) | Your line's capacity next to what transfers achieved |
 | [`/logs`](#logs) | Sends the log file to you |
 | [`/killall`](#killall) | Cancels every running download and upload |
 | [`/cleanup`](#cleanup) | Deletes leftover files from `downloads/` |
@@ -51,6 +52,21 @@ same thing. The same applies to story links.
 
 Private channel links (`https://t.me/c/...`) work as long as your user session
 is a member.
+
+### Posts that skip the download entirely
+
+If the source allows forwarding, the post is copied server-side: Telegram moves
+it between chats internally, nothing is transferred over your connection, and it
+arrives in seconds instead of the minutes a download plus a re-upload costs. A
+600 MB video on a 10 Mbps line is roughly fifteen minutes saved.
+
+Only the user session can see the source, so it is the account that performs the
+copy — meaning these posts arrive under your own name rather than the bot's.
+That is the one visible difference. Set `SERVER_SIDE_COPY = 0` in `config.env` if
+you would rather everything came from the bot.
+
+Posts with content protection enabled cannot be copied and always take the full
+download path, unchanged.
 
 ## `/bdl <start_url> <end_url>`
 
@@ -117,6 +133,30 @@ Current status of the machine the bot runs on:
 - CPU, RAM and disk percentages
 
 Handy for checking free space before starting a large batch.
+
+The disk figures describe the volume downloads are staged on (`DOWNLOAD_DIR`),
+which is not necessarily the one the code is checked out to.
+
+## `/speed`
+
+Measures your internet connection against a neutral host — not Telegram — and
+reports it next to the throughput the last download and upload actually got:
+
+```
+📶 Connection
+➜ Line download: 1.25 MB/s (10.0 Mbps)
+➜ Line upload: 1.36 MB/s (10.9 Mbps)
+
+📊 Last transfer
+➜ Last download: 1.31 MB/s — 105% of line
+➜ Last upload: 1.28 MB/s — 94% of line
+```
+
+Use this before trying to tune anything. A transfer sitting near the line figure
+means the bot is already moving bytes as fast as the connection allows, and no
+setting will make it faster — the ceiling is the link, not the code. Bots that
+appear much faster are almost always running on a server rather than a home
+connection.
 
 ## `/logs`
 

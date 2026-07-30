@@ -16,7 +16,11 @@ from helpers.utils import (
     processMediaGroup,
     download_with_fallback,
     send_media,
-    is_connection_error
+    is_connection_error,
+    is_copyable,
+    try_server_side_copy,
+    measure_line_capacity,
+    LAST_SPEED
 )
 
 from helpers.forward import check_forward_permission, resolve_forward_chat_id
@@ -136,7 +140,9 @@ async def help_command(_, message: Message):
         "➤ **Cleanup**\n"
         "   – Send `/cleanup` to remove temporary downloaded files from disk.\n\n"
         "➤ **Stats**\n"
-        "   – Send `/stats` to view current status"
+        "   – Send `/stats` to view current status\n\n"
+        "➤ **Speed**\n"
+        "   – Send `/speed` to compare your connection against what transfers achieved"
     )
     
     markup = InlineKeyboardMarkup(
@@ -205,6 +211,18 @@ async def handle_download(bot: Client, message: Message, post_url: str):
             chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
 
             LOGGER(__name__).info(f"Downloading media from URL: {post_url}")
+
+            # Unprotected posts never need to touch this machine: Telegram will
+            # copy them between chats itself, which on a home connection is the
+            # difference between seconds and the minutes a download plus a
+            # re-upload costs. Protected posts fall straight through to the
+            # normal path, which is what the rest of this function is for.
+            if PyroConf.SERVER_SIDE_COPY and is_copyable(chat_message):
+                if await try_server_side_copy(
+                    user, bot, chat_message,
+                    forward_chat_id=effective_forward_chat_id,
+                ):
+                    return
 
             # Only the large media types declare a size worth reserving disk for;
             # photos and stickers stay at 0 and skip the space check.
@@ -759,7 +777,7 @@ async def download_range(bot: Client, message: Message):
     )
 
 
-@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "bdl", "dls", "bdls", "stats", "logs", "killall", "cleanup"]))
+@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "bdl", "dls", "bdls", "stats", "speed", "logs", "killall", "cleanup"]))
 async def handle_any_message(bot: Client, message: Message):
     if message.text and not message.text.startswith("/"):
         text = message.text.strip()
@@ -769,10 +787,53 @@ async def handle_any_message(bot: Client, message: Message):
             await track_task(handle_download(bot, message, text))
 
 
+@bot.on_message(filters.command("speed") & filters.private)
+async def speed(_, message: Message):
+    """Report what the line can do next to what the bot actually achieved.
+
+    Transfer speed on its own invites the wrong conclusion. "1.31 MB/s" sounds
+    like something to tune, right up until you see the connection itself only
+    does 1.3 -- at which point the bot is at 100% and no setting will help.
+    """
+    probing = await message.reply("**📶 Measuring your connection…**")
+
+    line = await measure_line_capacity()
+
+    def fmt(mbps):
+        return f"`{mbps:.2f} MB/s` (`{mbps * 8:.1f} Mbps`)" if mbps else "`unavailable`"
+
+    lines = [
+        "**📶 Connection**",
+        f"**➜ Line download:** {fmt(line['down'])}",
+        f"**➜ Line upload:** {fmt(line['up'])}",
+        "",
+        "**📊 Last transfer**",
+    ]
+
+    for leg, capacity in (("download", line["down"]), ("upload", line["up"])):
+        achieved = LAST_SPEED[leg]
+        if achieved is None:
+            lines.append(f"**➜ Last {leg}:** `none yet`")
+            continue
+        pct = f" — **{achieved / capacity * 100:.0f}%** of line" if capacity else ""
+        lines.append(f"**➜ Last {leg}:** {fmt(achieved)}{pct}")
+
+    lines += [
+        "",
+        "A transfer close to the line figure means the bot is already moving "
+        "bytes as fast as this connection allows, and no setting will make it "
+        "faster. Only a faster connection will.",
+    ]
+
+    await probing.edit("\n".join(lines))
+
+
 @bot.on_message(filters.command("stats") & filters.private)
 async def stats(_, message: Message):
     currentTime = get_readable_time(time() - PyroConf.BOT_START_TIME)
-    total, used, free = shutil.disk_usage(".")
+    # Report the volume downloads actually land on, which is no longer the one
+    # the code is checked out to.
+    total, used, free = shutil.disk_usage(limits.downloads_volume())
     total = get_readable_file_size(total)
     used = get_readable_file_size(used)
     free = get_readable_file_size(free)
