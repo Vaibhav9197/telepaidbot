@@ -52,20 +52,42 @@ MB = 1024 * 1024
 MIN_USEFUL_SAMPLE_MB = 32
 
 
-async def shutdown(client) -> None:
-    """Stop a client and let its sockets finish closing.
+def silence_teardown_noise() -> None:
+    """Suppress the finalizer race that prints a traceback after the results.
 
-    Client.stop() asks the transports to close but does not wait for it. On
-    Windows the proactor finishes the job on a later tick, so with nothing left
-    to run the loop shuts first and the sockets are finalised against a closed
-    loop -- printing a RuntimeError traceback after the results, which looks
-    like the benchmark crashed when it had already succeeded.
+    A StreamWriter that outlives the event loop tries to close itself during
+    interpreter shutdown, and close() schedules work on a loop that is already
+    gone. Python cannot propagate an exception out of __del__, so it prints
+    "Exception ignored in: StreamWriter.__del__" and carries on -- the script
+    still exits 0 with correct numbers, but it reads as a crash.
+
+    This is suppression, not a fix. The orphaned writer lives inside pyrogram:
+    TCP.close returns early when a writer is already closing and leaves the
+    reference in place, so nothing this script can reach still owns it by the
+    time it becomes collectable. Waiting does not help (the finalizer has not
+    run yet) and neither does gc.collect (the client still holds a reference).
+
+    Matched narrowly -- this one exception type, this one message -- so any
+    other unraisable error still gets printed.
     """
+    previous = sys.unraisablehook
+
+    def hook(unraisable):
+        exc = unraisable.exc_value
+        if isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc):
+            return
+        previous(unraisable)
+
+    sys.unraisablehook = hook
+
+
+async def shutdown(client) -> None:
+    """Stop a client and give its transports a tick to finish closing."""
     try:
         await client.stop()
     except Exception as e:
         print(f"(client did not stop cleanly: {type(e).__name__}: {e})")
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.25)
 
 
 async def measure(client, message, workers, sample_bytes):
@@ -232,7 +254,10 @@ async def main():
         actual_mb = min(sample_mb * MB, media.file_size) / MB
         if actual_mb < MIN_USEFUL_SAMPLE_MB:
             chunks = max(1, int(actual_mb))
-            print(f"⚠  This file is too small to measure. Only {actual_mb:.0f} MB "
+            # Plain ASCII on purpose: the Windows console runs cp1252, and a
+            # warning that raises UnicodeEncodeError takes down the run it was
+            # supposed to caution about.
+            print(f"WARNING: this file is too small to measure. Only {actual_mb:.0f} MB "
                   f"({chunks} chunk{'s' if chunks != 1 else ''}) will be fetched\n"
                   f"   per run, so the highest worker counts get one round trip "
                   f"each and the\n"
@@ -286,4 +311,5 @@ async def main():
 
 
 if __name__ == "__main__":
+    silence_teardown_noise()
     sys.exit(asyncio.run(main()))
