@@ -5,16 +5,25 @@ import os
 import shutil
 from typing import Optional
 
+from config import PyroConf
 from logger import LOGGER
 
 SIZE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
 
+# Staging root for in-flight downloads. Callers used to default to a relative
+# "downloads", which resolved against the working directory and so landed inside
+# the checkout -- and, for a checkout under a sync client, inside the synced tree.
+# See PyroConf.DOWNLOAD_DIR for why that is expensive.
+DOWNLOADS_ROOT = PyroConf.DOWNLOAD_DIR
+
+
 def get_download_path(
     folder_id: int,
     filename: str,
-    root_dir: str = "downloads",
+    root_dir: Optional[str] = None,
     item_id=None,
 ) -> str:
+    root_dir = root_dir or DOWNLOADS_ROOT
     safe_name = os.path.basename(filename)
     if not safe_name:
         safe_name = str(folder_id)
@@ -44,7 +53,7 @@ def cleanup_download(path: str) -> None:
 
         # Walk back up the per-item and per-request folders, pruning whatever is
         # left empty, but never past the downloads root itself.
-        root = os.path.realpath("downloads")
+        root = os.path.realpath(DOWNLOADS_ROOT)
         folder = os.path.dirname(os.path.realpath(path))
         while os.path.isdir(folder) and folder != root and folder.startswith(root):
             if os.listdir(folder):
@@ -56,7 +65,8 @@ def cleanup_download(path: str) -> None:
         LOGGER(__name__).error(f"Cleanup failed for {path}: {e}")
 
 
-def cleanup_downloads_root(root_dir: str = "downloads") -> tuple[int, int]:
+def cleanup_downloads_root(root_dir: Optional[str] = None) -> tuple[int, int]:
+    root_dir = root_dir or DOWNLOADS_ROOT
     if not os.path.isdir(root_dir):
         return 0, 0
 

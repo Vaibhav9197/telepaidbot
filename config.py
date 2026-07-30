@@ -1,6 +1,8 @@
 # Copyright (C) @TheSmartBisnu
 # Channel: https://t.me/itsSmartDev
 
+import os
+import tempfile
 from os import getenv
 from time import time
 from dotenv import load_dotenv
@@ -72,3 +74,26 @@ class PyroConf(object):
     )
 
     FORWARD_CHAT_ID = getenv("FORWARD_CHAT_ID", "").strip() or None
+
+    # Where downloads are staged before being sent back to Telegram.
+    #
+    # This deliberately defaults OUTSIDE the project directory. A checkout living
+    # under OneDrive, Dropbox or iCloud turns every downloaded file into a second
+    # upload the moment it lands: the sync client starts pushing a 600 MB video to
+    # its own cloud over the same upstream the bot needs for Telegram, and the two
+    # halve each other. It is also what makes a freshly written file briefly
+    # unrenamable on Windows, which helpers/fastdl.finalize exists to survive.
+    DOWNLOAD_DIR = os.path.abspath(
+        getenv("DOWNLOAD_DIR", "").strip()
+        or os.path.join(tempfile.gettempdir(), "RestrictedContentDL")
+    )
+
+    # Copy unprotected posts server-side instead of downloading and re-uploading
+    # them. Telegram moves the bytes internally, so the transfer costs no local
+    # bandwidth and finishes in seconds rather than minutes. Only possible when the
+    # source allows forwarding; protected posts always take the download path.
+    SERVER_SIDE_COPY = getenv("SERVER_SIDE_COPY", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )

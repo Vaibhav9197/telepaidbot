@@ -17,8 +17,10 @@
 # This lives in its own module because helpers/utils.py needs the same limits as
 # main.py and cannot import from main without a circular import.
 
+import os
 import asyncio
 import shutil
+from typing import Optional
 
 from config import PyroConf
 from logger import LOGGER
@@ -69,8 +71,34 @@ def init_limits() -> None:
     )
 
 
-def free_space(path: str = ".") -> int:
-    return shutil.disk_usage(path).free
+def downloads_volume(path: Optional[str] = None) -> str:
+    """A real path on the volume that will hold downloads.
+
+    The download root is created on demand by get_download_path and removed again
+    by /cleanup, so it may legitimately not exist when we need to measure it.
+    disk_usage needs a path that exists; the nearest existing parent is on the
+    same volume, which is all we are actually asking about.
+    """
+    path = path or PyroConf.DOWNLOAD_DIR
+
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if not parent or parent == path:
+            return "."
+        path = parent
+
+    return path
+
+
+def free_space(path: Optional[str] = None) -> int:
+    """Free bytes on the volume that will actually hold the download.
+
+    Checking the working directory was right only while downloads landed inside
+    the checkout. They now stage under PyroConf.DOWNLOAD_DIR, which is routinely
+    a different volume, and measuring the wrong drive either blocks a download
+    that would have fit or admits one that cannot.
+    """
+    return shutil.disk_usage(downloads_volume(path)).free
 
 
 async def ensure_disk_space(needed_bytes: int, message=None) -> bool:
