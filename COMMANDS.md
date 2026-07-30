@@ -13,6 +13,7 @@ Everything you can send the bot in Telegram.
 | [`/bdl <start> <end>`](#bdl-start_url-end_url) | Download a range of posts |
 | [`/dls <url>`](#dls-url) | Download one story |
 | [`/bdls <start> <end>`](#bdls-start_url-end_url) | Download a range of stories |
+| [`/retry`](#retry) | Resume the last batch, re-running only what failed |
 | [`/stats`](#stats) | Uptime, disk, memory, CPU, network totals |
 | [`/speed`](#speed) | Your line's capacity next to what transfers achieved |
 | [`/logs`](#logs) | Sends the log file to you |
@@ -87,12 +88,20 @@ an album is fetched once even when several IDs in the range belong to it. When
 the range finishes you get a summary:
 
 ```
-✅ Batch Process Complete!
+⚠️ Batch finished with failures
 ━━━━━━━━━━━━━━━━━━━
 📥 Downloaded : 18 post(s)
 ⏭️ Skipped    : 2 (no content)
 ❌ Failed     : 1 error(s)
+
+Send /retry to run the remaining 1 again. Everything already downloaded is skipped.
 ```
+
+The header reads **✅ Batch Complete!** instead when nothing was left outstanding.
+
+Progress is recorded per item as the batch runs, so a range interrupted by a
+dropped connection, a crash or [`/killall`](#killall) can be picked up with
+[`/retry`](#retry) rather than started over.
 
 Use [`/killall`](#killall) to stop a batch part-way.
 
@@ -120,7 +129,8 @@ Download a range of stories.
 ```
 
 Both links must be valid story links from the same user or channel, in ascending
-order. You get a downloaded / failed summary at the end.
+order. You get a downloaded / failed summary at the end, and as with `/bdl` an
+interrupted range can be resumed with [`/retry`](#retry).
 
 ## `/stats`
 
@@ -136,6 +146,39 @@ Handy for checking free space before starting a large batch.
 
 The disk figures describe the volume downloads are staged on (`DOWNLOAD_DIR`),
 which is not necessarily the one the code is checked out to.
+
+## `/retry`
+
+Resumes the last batch, re-running only the items that did not get through.
+
+```
+/retry
+```
+
+Batches record every item's result as they go, so an interrupted run leaves a
+resume point rather than a lost range:
+
+```
+🔄 Resuming batch from 2026-07-30T09:14:02
+━━━━━━━━━━━━━━━━━━━
+✅ Already done : 41 — will not be downloaded again
+⏭️ Skipped      : 3 — cannot succeed, ignoring
+🔄 Retrying     : 16 of 60
+```
+
+Anything already delivered is left alone — on a slow line, re-downloading 41
+posts to recover 16 costs far more than the failures did.
+
+Items are only retried if another attempt could plausibly work: a dropped
+connection, a rate limit, a channel you had not joined yet. Posts that failed
+for reasons no retry can fix — a poll, a file over the size limit, an expired
+story, a malformed link — are recorded as skipped and stay that way, so `/retry`
+cannot loop on them forever.
+
+The resume point survives a restart of the bot, so a crash mid-batch is
+recoverable. It is cleared automatically once the batch completes; `/retry` with
+nothing outstanding just tells you so. Run it while a batch is still going and
+it declines, rather than having two runs fight over the same items.
 
 ## `/speed`
 
@@ -183,6 +226,10 @@ Two things to know:
   commands.
 - A cancelled download leaves a partial `.temp` file behind. Follow with
   [`/cleanup`](#cleanup) if space is tight.
+
+Cancelling a batch keeps its resume point. The items you interrupted are
+recorded as not-yet-attempted rather than failed, so [`/retry`](#retry) picks up
+exactly where it stopped.
 
 ## `/cleanup`
 

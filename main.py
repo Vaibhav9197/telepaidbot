@@ -28,6 +28,8 @@ from helpers.forward import check_forward_permission, resolve_forward_chat_id
 from helpers import limits
 from helpers.limits import init_limits, ensure_disk_space
 
+from helpers.batch import BatchState, OK, RETRY, SKIP
+
 from helpers.files import (
     get_download_path,
     fileSizeLimit,
@@ -139,6 +141,8 @@ async def help_command(_, message: Message):
         "   – Send `/logs` to download the bot’s logs file.\n\n"
         "➤ **Cleanup**\n"
         "   – Send `/cleanup` to remove temporary downloaded files from disk.\n\n"
+        "➤ **Retry**\n"
+        "   – Send `/retry` to resume the last batch, skipping what already arrived.\n\n"
         "➤ **Stats**\n"
         "   – Send `/stats` to view current status\n\n"
         "➤ **Speed**\n"
@@ -182,7 +186,15 @@ async def discard_progress(progress_message):
         LOGGER(__name__).warning(f"Could not remove progress message: {e}")
 
 
-async def handle_download(bot: Client, message: Message, post_url: str):
+async def handle_download(bot: Client, message: Message, post_url: str) -> str:
+    """Deliver one post. Returns OK, SKIP or RETRY.
+
+    The return value is what lets /retry resume: almost every failure in here is
+    caught and reported to the user rather than raised, so without it a caller
+    cannot tell a delivered post from a failed one. SKIP means a later attempt
+    would fail the same way -- a poll, an oversized file, a malformed link --
+    and RETRY means it might not.
+    """
     global forward_chat_id
     # Held for the whole item, so the number of files on disk stays bounded no
     # matter how many requests arrive. The download and upload legs are gated
@@ -222,7 +234,7 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                     user, bot, chat_message,
                     forward_chat_id=effective_forward_chat_id,
                 ):
-                    return
+                    return OK
 
             # Only the large media types declare a size worth reserving disk for;
             # photos and stickers stay at 0 and skip the space check.
@@ -240,7 +252,8 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                 if not await fileSizeLimit(
                     expected_size, message, "download", user.me.is_premium
                 ):
-                    return
+                    # The file will be exactly as oversized next time.
+                    return SKIP
 
             raw_caption, raw_caption_entities = get_raw_text(
                 chat_message.caption, chat_message.caption_entities
@@ -254,7 +267,8 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                     await message.reply(
                         "**Could not extract any valid media from the media group.**"
                     )
-                return
+                    return RETRY
+                return OK
 
             has_downloadable_media = (
                 chat_message.photo
@@ -279,7 +293,8 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                 async with limits.download_semaphore:
                     if not await ensure_disk_space(expected_size, message):
                         await progress_message.delete()
-                        return
+                        # Space frees up as uploads finish, so this is temporary.
+                        return RETRY
 
                     media_path = await download_with_fallback(
                         chat_message, download_path, progress_message, start_time
@@ -289,13 +304,13 @@ async def handle_download(bot: Client, message: Message, post_url: str):
 
                 if not media_path or not os.path.exists(media_path):
                     await progress_message.edit("**❌ Download failed: File not saved properly**")
-                    return
+                    return RETRY
 
                 file_size = os.path.getsize(media_path)
                 if file_size == 0:
                     await progress_message.edit("**❌ Download failed: File is empty**")
                     cleanup_download(media_path)
-                    return
+                    return RETRY
 
                 LOGGER(__name__).info(f"Downloaded media: {media_path} (Size: {file_size} bytes)")
 
@@ -328,9 +343,11 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                     cleanup_download(media_path)
 
                 await progress_message.delete()
+                return OK
 
             elif chat_message.poll:
                 await message.reply("**This post contains a poll which cannot be downloaded.**")
+                return SKIP
 
             elif chat_message.text or chat_message.caption:
                 txt = raw_text or raw_caption
@@ -354,8 +371,10 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                         LOGGER(__name__).info(f"Copied text message to chat: {effective_forward_chat_id}")
                     except Exception as e:
                         LOGGER(__name__).error(f"Failed to copy text message to {effective_forward_chat_id}: {e}")
+                return OK
             else:
                 await message.reply("**No media or text found in the post URL.**")
+                return SKIP
 
         except FloodWait as e:
             wait_s = int(getattr(e, "value", 0) or 0)
@@ -363,7 +382,8 @@ async def handle_download(bot: Client, message: Message, post_url: str):
             await discard_progress(progress_message)
             if wait_s > 0:
                 await asyncio.sleep(wait_s + 1)
-            return
+            # The item was never attempted, only rate limited.
+            return RETRY
         except PeerIdInvalid as e:
             LOGGER(__name__).error(f"PeerIdInvalid for {post_url}: {e}")
             await discard_progress(progress_message)
@@ -373,6 +393,8 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                 "Make sure the user account has joined the channel/group.\n\n"
                 f"**Details:** `{e}`"
             )
+            # Joining the chat fixes this, so it is worth another attempt later.
+            return RETRY
         except BadRequest as e:
             LOGGER(__name__).error(f"BadRequest for {post_url}: {e}")
             await discard_progress(progress_message)
@@ -381,14 +403,18 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                 f"Telegram returned an error: `{e}`\n\n"
                 "This may happen if the message ID is invalid or the chat is inaccessible."
             )
+            # A rejected message id will be rejected identically next time.
+            return SKIP
         except KeyError as e:
             LOGGER(__name__).error(f"KeyError for {post_url}: {e}")
             await discard_progress(progress_message)
             await message.reply(f"**❌ Invalid URL format:** `{e}`")
+            return SKIP
         except ValueError as e:
             LOGGER(__name__).warning(f"Invalid post URL {post_url}: {e}")
             await discard_progress(progress_message)
             await message.reply(f"**❌ {e}**")
+            return SKIP
         except (OSError, asyncio.TimeoutError) as e:
             if not is_connection_error(e):
                 raise
@@ -397,16 +423,22 @@ async def handle_download(bot: Client, message: Message, post_url: str):
             await message.reply(
                 "**❌ Network connection lost**\n\n"
                 "The download was retried and the link kept dropping. "
-                "Send the same URL again once the connection is stable.\n\n"
+                "Send the same URL again once the connection is stable, "
+                "or use /retry to resume the whole batch.\n\n"
                 f"**Details:** `{type(e).__name__}: {e}`"
             )
+            return RETRY
         except Exception as e:
             LOGGER(__name__).error(f"Unexpected error for {post_url}: {e}")
             await discard_progress(progress_message)
             await message.reply("**❌ An unexpected error occurred.** Check /logs for details.")
+            # Cause unknown, so assume it might not recur rather than writing the
+            # item off -- /retry re-reports anything that turns out to be real.
+            return RETRY
 
 
-async def handle_story_download(bot: Client, message: Message, story_url: str):
+async def handle_story_download(bot: Client, message: Message, story_url: str) -> str:
+    """Deliver one story. Returns OK, SKIP or RETRY -- see handle_download."""
     global forward_chat_id
     async with limits.pipeline_semaphore:
         if "?" in story_url:
@@ -451,7 +483,8 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
                     "It may have expired (stories are only visible for 24h unless pinned), "
                     "or the user session does not have access to view it."
                 )
-                return
+                # An expired story does not come back.
+                return SKIP
 
             LOGGER(__name__).info(f"Downloading story from URL: {story_url}")
 
@@ -459,13 +492,13 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
                 if not await fileSizeLimit(
                     story.video.file_size, message, "download", user.me.is_premium
                 ):
-                    return
+                    return SKIP
 
             if not (story.photo or story.video):
                 await message.reply(
                     "**This story has no downloadable media.**"
                 )
-                return
+                return SKIP
 
             raw_caption, raw_caption_entities = get_raw_text(
                 story.caption, story.caption_entities
@@ -485,7 +518,7 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
             async with limits.download_semaphore:
                 if not await ensure_disk_space(expected_size, message):
                     await progress_message.delete()
-                    return
+                    return RETRY
 
                 media_path = await download_with_fallback(
                     story, download_path, progress_message, start_time
@@ -497,13 +530,13 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
                 await progress_message.edit(
                     "**❌ Download failed: File not saved properly**"
                 )
-                return
+                return RETRY
 
             file_size = os.path.getsize(media_path)
             if file_size == 0:
                 await progress_message.edit("**❌ Download failed: File is empty**")
                 cleanup_download(media_path)
-                return
+                return RETRY
 
             LOGGER(__name__).info(
                 f"Downloaded story: {media_path} (Size: {file_size} bytes)"
@@ -527,6 +560,7 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
                 cleanup_download(media_path)
 
             await progress_message.delete()
+            return OK
 
         except FloodWait as e:
             wait_s = int(getattr(e, "value", 0) or 0)
@@ -534,7 +568,7 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
             await discard_progress(progress_message)
             if wait_s > 0:
                 await asyncio.sleep(wait_s + 1)
-            return
+            return RETRY
         except PeerIdInvalid as e:
             LOGGER(__name__).error(f"PeerIdInvalid for story {story_url}: {e}")
             await discard_progress(progress_message)
@@ -544,6 +578,7 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
                 "Make sure the user account follows or has access to it.\n\n"
                 f"**Details:** `{e}`"
             )
+            return RETRY
         except BadRequest as e:
             LOGGER(__name__).error(f"BadRequest for story {story_url}: {e}")
             await discard_progress(progress_message)
@@ -552,9 +587,11 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
                 f"Telegram returned an error: `{e}`\n\n"
                 "The story may have expired, been deleted, or the ID is invalid."
             )
+            return SKIP
         except ValueError as e:
             await discard_progress(progress_message)
             await message.reply(f"**❌ Invalid story URL:** `{e}`")
+            return SKIP
         except (OSError, asyncio.TimeoutError) as e:
             if not is_connection_error(e):
                 raise
@@ -563,13 +600,16 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
             await message.reply(
                 "**❌ Network connection lost**\n\n"
                 "The download was retried and the link kept dropping. "
-                "Send the same URL again once the connection is stable.\n\n"
+                "Send the same URL again once the connection is stable, "
+                "or use /retry to resume the whole batch.\n\n"
                 f"**Details:** `{type(e).__name__}: {e}`"
             )
+            return RETRY
         except Exception as e:
             LOGGER(__name__).error(f"Unexpected error for story {story_url}: {e}")
             await discard_progress(progress_message)
             await message.reply("**❌ An unexpected error occurred.** Check /logs for details.")
+            return RETRY
 
 
 @bot.on_message(filters.command("dl") & filters.private)
@@ -602,6 +642,137 @@ async def download_story(bot: Client, message: Message):
     await track_task(handle_story_download(bot, message, story_url))
 
 
+async def preflight_post(state: BatchState, msg_id: int, seen_groups: set) -> bool:
+    """Whether this post is worth handing to the downloader at all.
+
+    Cheap rejections happen here rather than inside handle_download so a range
+    covering a mostly-empty channel does not spend a pipeline slot per gap. The
+    album check is the important one: every member of a group would otherwise
+    fetch and send the whole group again.
+    """
+    chat_id, _ = getChatMsgID(state.url_for(msg_id))
+    chat_msg = await user.get_messages(chat_id=chat_id, message_ids=msg_id)
+    if not chat_msg:
+        return False
+
+    if chat_msg.media_group_id:
+        if chat_msg.media_group_id in seen_groups:
+            return False
+        seen_groups.add(chat_msg.media_group_id)
+
+    has_media = bool(chat_msg.media_group_id or chat_msg.media)
+    has_text = bool(chat_msg.text or chat_msg.caption)
+    return has_media or has_text
+
+
+async def run_batch(bot: Client, message: Message, state: BatchState, label: str):
+    """Work through everything still outstanding in `state`, recording each result.
+
+    Shared by /bdl, /bdls and /retry, which differ only in how the item list was
+    arrived at. Progress is written to disk as each item retires, so an interrupt
+    at any point leaves a resume point rather than a lost range.
+    """
+    todo = state.remaining()
+    loading = await message.reply(f"📥 **Downloading {label}…**")
+
+    seen_groups = set()
+    in_flight = []  # (item_id, task) oldest first
+
+    async def retire_one() -> bool:
+        """Settle the oldest item. False means the batch was cancelled."""
+        item_id, task = in_flight.pop(0)
+        result = await retire(task)
+
+        if isinstance(result, asyncio.CancelledError):
+            # Never judged, so do not record a verdict for it.
+            state.restore(item_id)
+            state.save()
+            return False
+
+        if isinstance(result, Exception):
+            LOGGER(__name__).error(f"Error on {state.url_for(item_id)}: {result}")
+            state.mark(item_id, RETRY)
+        else:
+            # Handlers return an outcome; anything else is treated as delivered
+            # so an untouched code path cannot silently mark work as failed.
+            state.mark(item_id, result if result in (OK, RETRY, SKIP) else OK)
+
+        state.save()
+        return True
+
+    cancelled = False
+
+    for item_id in todo:
+        if state.kind == "posts":
+            try:
+                if not await preflight_post(state, item_id, seen_groups):
+                    state.mark(item_id, SKIP)
+                    state.save()
+                    continue
+            except Exception as e:
+                LOGGER(__name__).error(f"Error at {state.url_for(item_id)}: {e}")
+                state.mark(item_id, RETRY)
+                state.save()
+                continue
+
+        coro = (
+            handle_story_download(bot, message, state.url_for(item_id))
+            if state.kind == "stories"
+            else handle_download(bot, message, state.url_for(item_id))
+        )
+        in_flight.append((item_id, track_task(coro)))
+
+        # A rolling window rather than draining after every item: draining would
+        # leave nothing in flight to overlap, defeating the pipeline.
+        if len(in_flight) >= PyroConf.PIPELINE_DEPTH:
+            if not await retire_one():
+                cancelled = True
+                break
+            await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
+
+    # Drain whatever is still in the window, oldest first.
+    while in_flight and not cancelled:
+        if not await retire_one():
+            cancelled = True
+
+    # Anything still queued behind a cancellation was never attempted.
+    for item_id, task in in_flight:
+        task.cancel()
+        state.restore(item_id)
+    state.save()
+
+    await discard_progress(loading)
+
+    counts = state.counts()
+    noun = "story(s)" if state.kind == "stories" else "post(s)"
+    header = (
+        "**❌ Batch cancelled**" if cancelled
+        else "**✅ Batch Complete!**" if state.is_complete()
+        else "**⚠️ Batch finished with failures**"
+    )
+
+    summary = [
+        header,
+        "━━━━━━━━━━━━━━━━━━━",
+        f"📥 **Downloaded** : `{counts['done']}` {noun}",
+        f"⏭️ **Skipped**    : `{counts['skipped']}` (no content)",
+        f"❌ **Failed**     : `{counts['failed']}` error(s)",
+    ]
+    if counts["pending"]:
+        summary.append(f"⏸️ **Not attempted** : `{counts['pending']}`")
+
+    if state.is_complete():
+        BatchState.clear()
+    else:
+        summary += [
+            "",
+            f"Send `/retry` to run the remaining `{len(state.remaining())}` again. "
+            "Everything already downloaded is skipped.",
+        ]
+
+    await message.reply("\n".join(summary))
+
+
 @bot.on_message(filters.command("bdls") & filters.private)
 async def download_story_range(bot: Client, message: Message):
     args = message.text.split()
@@ -630,52 +801,14 @@ async def download_story_range(bot: Client, message: Message):
             "**❌ Invalid range: start ID cannot exceed end ID.**"
         )
 
-    prefix = f"https://t.me/{start_chat}/s"
-    loading = await message.reply(
-        f"📥 **Downloading stories {start_id}–{end_id}…**"
+    state = BatchState(
+        kind="stories",
+        prefix=f"https://t.me/{start_chat}/s",
+        ids=list(range(start_id, end_id + 1)),
     )
+    state.save()
 
-    downloaded = failed = 0
-    batch_tasks = []
-    # A rolling window rather than draining after every item: draining would
-    # leave nothing in flight to overlap, defeating the pipeline.
-    PIPELINE_DEPTH = PyroConf.PIPELINE_DEPTH
-
-    for sid in range(start_id, end_id + 1):
-        url = f"{prefix}/{sid}"
-        task = track_task(handle_story_download(bot, message, url))
-        batch_tasks.append(task)
-
-        if len(batch_tasks) >= PIPELINE_DEPTH:
-            result = await retire(batch_tasks.pop(0))
-            if isinstance(result, asyncio.CancelledError):
-                await loading.delete()
-                return await message.reply(
-                    f"**❌ Batch canceled** after downloading `{downloaded}` stories."
-                )
-            elif isinstance(result, Exception):
-                failed += 1
-                LOGGER(__name__).error(f"Error: {result}")
-            else:
-                downloaded += 1
-
-            await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
-
-    # Drain whatever is still in the window, oldest first.
-    while batch_tasks:
-        result = await retire(batch_tasks.pop(0))
-        if isinstance(result, Exception):
-            failed += 1
-        else:
-            downloaded += 1
-
-    await loading.delete()
-    await message.reply(
-        "**✅ Batch Story Process Complete!**\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        f"📥 **Downloaded** : `{downloaded}` story(s)\n"
-        f"❌ **Failed**     : `{failed}` error(s)"
-    )
+    await run_batch(bot, message, state, f"stories {start_id}–{end_id}")
 
 
 @bot.on_message(filters.command("bdl") & filters.private)
@@ -707,77 +840,17 @@ async def download_range(bot: Client, message: Message):
     except Exception:
         pass
 
-    prefix = args[1].rsplit("/", 1)[0]
-    loading = await message.reply(f"📥 **Downloading posts {start_id}–{end_id}…**")
-
-    downloaded = skipped = failed = 0
-    processed_media_groups = set()
-    batch_tasks = []
-    # A rolling window rather than draining after every item: draining would
-    # leave nothing in flight to overlap, defeating the pipeline.
-    PIPELINE_DEPTH = PyroConf.PIPELINE_DEPTH
-
-    for msg_id in range(start_id, end_id + 1):
-        url = f"{prefix}/{msg_id}"
-        try:
-            chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
-            if not chat_msg:
-                skipped += 1
-                continue
-
-            if chat_msg.media_group_id:
-                if chat_msg.media_group_id in processed_media_groups:
-                    skipped += 1
-                    continue
-                processed_media_groups.add(chat_msg.media_group_id)
-
-            has_media = bool(chat_msg.media_group_id or chat_msg.media)
-            has_text  = bool(chat_msg.text or chat_msg.caption)
-            if not (has_media or has_text):
-                skipped += 1
-                continue
-
-            task = track_task(handle_download(bot, message, url))
-            batch_tasks.append(task)
-
-            if len(batch_tasks) >= PIPELINE_DEPTH:
-                result = await retire(batch_tasks.pop(0))
-                if isinstance(result, asyncio.CancelledError):
-                    await loading.delete()
-                    return await message.reply(
-                        f"**❌ Batch canceled** after downloading `{downloaded}` posts."
-                    )
-                elif isinstance(result, Exception):
-                    failed += 1
-                    LOGGER(__name__).error(f"Error: {result}")
-                else:
-                    downloaded += 1
-
-                await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
-
-        except Exception as e:
-            failed += 1
-            LOGGER(__name__).error(f"Error at {url}: {e}")
-
-    # Drain whatever is still in the window, oldest first.
-    while batch_tasks:
-        result = await retire(batch_tasks.pop(0))
-        if isinstance(result, Exception):
-            failed += 1
-        else:
-            downloaded += 1
-
-    await loading.delete()
-    await message.reply(
-        "**✅ Batch Process Complete!**\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        f"📥 **Downloaded** : `{downloaded}` post(s)\n"
-        f"⏭️ **Skipped**    : `{skipped}` (no content)\n"
-        f"❌ **Failed**     : `{failed}` error(s)"
+    state = BatchState(
+        kind="posts",
+        prefix=args[1].rsplit("/", 1)[0],
+        ids=list(range(start_id, end_id + 1)),
     )
+    state.save()
+
+    await run_batch(bot, message, state, f"posts {start_id}–{end_id}")
 
 
-@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "bdl", "dls", "bdls", "stats", "speed", "logs", "killall", "cleanup"]))
+@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "bdl", "dls", "bdls", "retry", "stats", "speed", "logs", "killall", "cleanup"]))
 async def handle_any_message(bot: Client, message: Message):
     if message.text and not message.text.startswith("/"):
         text = message.text.strip()
@@ -785,6 +858,44 @@ async def handle_any_message(bot: Client, message: Message):
             await track_task(handle_story_download(bot, message, text))
         else:
             await track_task(handle_download(bot, message, text))
+
+
+@bot.on_message(filters.command("retry") & filters.private)
+async def retry_batch(bot: Client, message: Message):
+    """Resume the last batch, re-running only what did not get through."""
+    state = BatchState.load()
+
+    if state is None:
+        return await message.reply(
+            "**Nothing to retry.**\n\n"
+            "No batch has been run yet, or the last one finished completely."
+        )
+
+    remaining = state.remaining()
+    if not remaining:
+        BatchState.clear()
+        return await message.reply(
+            "**Nothing to retry.** The last batch completed in full."
+        )
+
+    if any(not t.done() for t in RUNNING_TASKS):
+        return await message.reply(
+            "**⏳ Something is still running.**\n\n"
+            "Wait for it to finish, or send /killall first — otherwise the two "
+            "runs would fight over the same items."
+        )
+
+    counts = state.counts()
+    await message.reply(
+        f"**🔄 Resuming batch from {state.started}**\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ **Already done** : `{counts['done']}` — will not be downloaded again\n"
+        f"⏭️ **Skipped**      : `{counts['skipped']}` — cannot succeed, ignoring\n"
+        f"🔄 **Retrying**     : `{len(remaining)}` of `{counts['total']}`"
+    )
+
+    label = f"{len(remaining)} remaining {'story(s)' if state.kind == 'stories' else 'post(s)'}"
+    await run_batch(bot, message, state, label)
 
 
 @bot.on_message(filters.command("speed") & filters.private)
