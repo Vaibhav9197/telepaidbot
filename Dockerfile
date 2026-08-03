@@ -1,6 +1,9 @@
 FROM python:3.11-slim-bookworm
 
-ENV TZ=Asia/Dhaka
+# Overridable at build time so the image's clock matches wherever it is deployed;
+# compose can also override it at run time.
+ARG TZ=Asia/Kolkata
+ENV TZ=${TZ}
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && \

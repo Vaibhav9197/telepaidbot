@@ -1,0 +1,20 @@
+[Unit]
+Description=Restricted Content Downloader Telegram bot
+Documentation=https://github.com/Vaibhav9197/telepaidbot
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/rcdl
+ExecStart=/usr/bin/docker compose -f docker-compose.yml -f deploy/docker-compose.vps.yml up -d
+ExecStop=/usr/bin/docker compose -f docker-compose.yml -f deploy/docker-compose.vps.yml down
+ExecReload=/usr/bin/docker compose -f docker-compose.yml -f deploy/docker-compose.vps.yml up -d --build
+# Pulling a base image and building on 4 ARM cores can take a few minutes on
+# first start; the default 90s would kill it midway.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

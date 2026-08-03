@@ -1,0 +1,21 @@
+# Overrides applied on top of docker-compose.yml when running on the VPS.
+#
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.vps.yml up -d
+#
+# The systemd unit in this directory already passes both files.
+services:
+  media_bot:
+    environment:
+      # Overrides the image's build-time default so logs read in local time.
+      - TZ=${TZ:-Asia/Kolkata}
+    volumes:
+      # Staging area for in-flight downloads, on the host's big volume rather
+      # than the container overlay. DOWNLOAD_DIR=/data/tmp points at this.
+      - /var/lib/rcdl/tmp:/data/tmp
+    # Without a cap, docker's json logs grow until they take the volume that
+    # the downloads need.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

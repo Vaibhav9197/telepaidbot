@@ -1,0 +1,9 @@
+# Files consumed by Linux tooling must keep LF whatever platform they were
+# committed from. A single CR on a shebang line is enough to make bash fail with
+# "bad interpreter: /usr/bin/env bash^M", and systemd is no more forgiving about
+# its unit files -- both of which would only show up on the VPS, after a deploy.
+*.sh text eol=lf
+*.service text eol=lf
+*.yml text eol=lf
+Dockerfile text eol=lf
+deploy/config.env.oracle text eol=lf
