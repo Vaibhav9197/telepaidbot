@@ -16,6 +16,14 @@ SIZE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
 # See PyroConf.DOWNLOAD_DIR for why that is expensive.
 DOWNLOADS_ROOT = PyroConf.DOWNLOAD_DIR
 
+# Where downloads landed before DOWNLOAD_DIR existed. Files staged there are
+# still this bot's, and they are the ones most likely to be noticed, because
+# they sit in the checkout rather than out of sight in %TEMP% -- so /cleanup
+# reporting "no local downloads found" over the top of them reads as broken.
+LEGACY_DOWNLOADS_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "downloads"
+)
+
 
 # Characters Windows refuses outright in a filename, plus the control range.
 # Uploaders put all of these in file names, and Telegram passes them through
@@ -135,7 +143,19 @@ def cleanup_download(path: str) -> None:
 
 
 def cleanup_downloads_root(root_dir: Optional[str] = None) -> tuple[int, int]:
-    root_dir = root_dir or DOWNLOADS_ROOT
+    """Clear the staging root, and the pre-DOWNLOAD_DIR one it replaced."""
+    if root_dir is None:
+        files, freed = _cleanup_tree(DOWNLOADS_ROOT)
+        if os.path.realpath(LEGACY_DOWNLOADS_ROOT) != os.path.realpath(DOWNLOADS_ROOT):
+            extra_files, extra_freed = _cleanup_tree(LEGACY_DOWNLOADS_ROOT)
+            files += extra_files
+            freed += extra_freed
+        return files, freed
+
+    return _cleanup_tree(root_dir)
+
+
+def _cleanup_tree(root_dir: str) -> tuple[int, int]:
     if not os.path.isdir(root_dir):
         return 0, 0
 
