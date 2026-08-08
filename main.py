@@ -3,6 +3,7 @@
 
 import os
 import shutil
+import signal
 import psutil
 import asyncio
 from time import time
@@ -75,6 +76,35 @@ user = Client(
 RUNNING_TASKS = set()
 forward_chat_id = None
 
+# Set by /killall and by Ctrl+C. Cancelling the in-flight tasks is not enough on
+# its own: a batch loop that is between items would keep queueing replacements
+# for them while the cancellations were still landing, so the run would carry on
+# with a fresh set of tasks and look like the stop was ignored.
+STOP_REQUESTED = asyncio.Event()
+
+# How long shutdown may spend waiting for a client to close politely. A stop()
+# that blocks on a download which is never coming back is indistinguishable, to
+# the person holding Ctrl+C, from a bot that ignores it.
+SHUTDOWN_TIMEOUT = 10
+
+
+def stop_everything() -> int:
+    """Ask every running task to stop and report how many were still alive.
+
+    Deliberately does no awaiting: it is called both from a handler and from a
+    signal handler, and on a link that is dropping connections the reply that
+    follows can take a long time or never arrive at all. Nothing about stopping
+    the work should be waiting on the network.
+    """
+    STOP_REQUESTED.set()
+    cancelled = 0
+    for task in list(RUNNING_TASKS):
+        if not task.done():
+            task.cancel()
+            cancelled += 1
+    return cancelled
+
+
 def track_task(coro):
     task = asyncio.create_task(coro)
     RUNNING_TASKS.add(task)
@@ -96,6 +126,18 @@ async def retire(task):
         return asyncio.CancelledError()
     except Exception as e:
         return e
+
+
+async def drive_batch(bot: Client, message: Message, state: BatchState, label: str):
+    """Run a batch as a tracked task rather than inline in the handler.
+
+    Inline, the only cancellable things were the downloads underneath it, so
+    /killall could stop the transfer in progress but not the loop queueing the
+    next one. Tracking the loop puts it in reach of the same cancel.
+    """
+    result = await retire(track_task(run_batch(bot, message, state, label)))
+    if isinstance(result, Exception):
+        LOGGER(__name__).error(f"Batch {label} failed: {result}")
 
 
 @bot.on_message(filters.command("start") & filters.private)
@@ -673,6 +715,7 @@ async def run_batch(bot: Client, message: Message, state: BatchState, label: str
     at any point leaves a resume point rather than a lost range.
     """
     todo = state.remaining()
+    STOP_REQUESTED.clear()
     loading = await message.reply(f"📥 **Downloading {label}…**")
 
     seen_groups = set()
@@ -682,6 +725,13 @@ async def run_batch(bot: Client, message: Message, state: BatchState, label: str
         """Settle the oldest item. False means the batch was cancelled."""
         item_id, task = in_flight.pop(0)
         result = await retire(task)
+
+        if STOP_REQUESTED.is_set() and not task.cancelled():
+            # A stop that lands while this item is finishing still counts: keep
+            # its verdict, then let the caller wind the rest of the batch down.
+            state.mark(item_id, result if result in (OK, RETRY, SKIP) else RETRY)
+            state.save()
+            return False
 
         if isinstance(result, asyncio.CancelledError):
             # Never judged, so do not record a verdict for it.
@@ -702,44 +752,72 @@ async def run_batch(bot: Client, message: Message, state: BatchState, label: str
 
     cancelled = False
 
-    for item_id in todo:
-        if state.kind == "posts":
-            try:
-                if not await preflight_post(state, item_id, seen_groups):
-                    state.mark(item_id, SKIP)
-                    state.save()
-                    continue
-            except Exception as e:
-                LOGGER(__name__).error(f"Error at {state.url_for(item_id)}: {e}")
-                state.mark(item_id, RETRY)
-                state.save()
-                continue
-
-        coro = (
-            handle_story_download(bot, message, state.url_for(item_id))
-            if state.kind == "stories"
-            else handle_download(bot, message, state.url_for(item_id))
-        )
-        in_flight.append((item_id, track_task(coro)))
-
-        # A rolling window rather than draining after every item: draining would
-        # leave nothing in flight to overlap, defeating the pipeline.
-        if len(in_flight) >= PyroConf.PIPELINE_DEPTH:
-            if not await retire_one():
+    # /killall cancels this loop as well as the downloads under it, because the
+    # loop can be parked in preflight or in the inter-item delay when the stop
+    # arrives. Catching it here rather than letting it escape is what lets the
+    # run still put its state on disk and tell the user where it got to.
+    try:
+        for item_id in todo:
+            # Checked before anything expensive: preflight and the download
+            # itself can each sit on the network for minutes, and a stop should
+            # not have to outwait them before the loop notices.
+            if STOP_REQUESTED.is_set():
                 cancelled = True
                 break
-            await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
 
-    # Drain whatever is still in the window, oldest first.
-    while in_flight and not cancelled:
-        if not await retire_one():
-            cancelled = True
+            if state.kind == "posts":
+                try:
+                    if not await preflight_post(state, item_id, seen_groups):
+                        state.mark(item_id, SKIP)
+                        state.save()
+                        continue
+                except Exception as e:
+                    LOGGER(__name__).error(f"Error at {state.url_for(item_id)}: {e}")
+                    state.mark(item_id, RETRY)
+                    state.save()
+                    continue
+
+            coro = (
+                handle_story_download(bot, message, state.url_for(item_id))
+                if state.kind == "stories"
+                else handle_download(bot, message, state.url_for(item_id))
+            )
+            in_flight.append((item_id, track_task(coro)))
+
+            # A rolling window rather than draining after every item: draining
+            # would leave nothing in flight to overlap, defeating the pipeline.
+            if len(in_flight) >= PyroConf.PIPELINE_DEPTH:
+                if not await retire_one():
+                    cancelled = True
+                    break
+                await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
+
+        # Drain whatever is still in the window, oldest first.
+        while in_flight and not cancelled:
+            if not await retire_one():
+                cancelled = True
+    except asyncio.CancelledError:
+        LOGGER(__name__).info(f"Batch cancelled while running {label}")
+        cancelled = True
 
     # Anything still queued behind a cancellation was never attempted.
     for item_id, task in in_flight:
         task.cancel()
         state.restore(item_id)
     state.save()
+
+    # A cancelled task is not a finished one: it can still be inside a download
+    # holding a session open. Give the cancellations a moment to land so the
+    # summary below is not immediately followed by more transfer noise.
+    if in_flight:
+        try:
+            await asyncio.gather(
+                *(task for _, task in in_flight), return_exceptions=True
+            )
+        except asyncio.CancelledError:
+            # A second /killall while the first is still settling. The tasks are
+            # already cancelled; reporting the outcome matters more than waiting.
+            pass
 
     await discard_progress(loading)
 
@@ -808,7 +886,7 @@ async def download_story_range(bot: Client, message: Message):
     )
     state.save()
 
-    await run_batch(bot, message, state, f"stories {start_id}–{end_id}")
+    await drive_batch(bot, message, state, f"stories {start_id}–{end_id}")
 
 
 @bot.on_message(filters.command("bdl") & filters.private)
@@ -847,7 +925,7 @@ async def download_range(bot: Client, message: Message):
     )
     state.save()
 
-    await run_batch(bot, message, state, f"posts {start_id}–{end_id}")
+    await drive_batch(bot, message, state, f"posts {start_id}–{end_id}")
 
 
 @bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "bdl", "dls", "bdls", "retry", "stats", "speed", "logs", "killall", "cleanup"]))
@@ -895,7 +973,7 @@ async def retry_batch(bot: Client, message: Message):
     )
 
     label = f"{len(remaining)} remaining {'story(s)' if state.kind == 'stories' else 'post(s)'}"
-    await run_batch(bot, message, state, label)
+    await drive_batch(bot, message, state, label)
 
 
 @bot.on_message(filters.command("speed") & filters.private)
@@ -981,12 +1059,15 @@ async def logs(_, message: Message):
 
 @bot.on_message(filters.command("killall") & filters.private)
 async def cancel_all_tasks(_, message: Message):
-    cancelled = 0
-    for task in list(RUNNING_TASKS):
-        if not task.done():
-            task.cancel()
-            cancelled += 1
-    await message.reply(f"**Cancelled {cancelled} running task(s).**")
+    # Logged as well as replied: when the link is flapping the reply can be the
+    # part that fails, and "did the bot even see it?" is then unanswerable.
+    cancelled = stop_everything()
+    LOGGER(__name__).info(f"/killall received; cancelled {cancelled} task(s)")
+    await message.reply(
+        f"**🛑 Stopping — cancelled {cancelled} running task(s).**\n\n"
+        "A transfer already in flight can take a few seconds to unwind. "
+        "Send `/retry` afterwards to pick the batch up where it stopped."
+    )
 
 
 async def initialize():
@@ -997,12 +1078,104 @@ async def initialize():
         forward_chat_id = await resolve_forward_chat_id(PyroConf.FORWARD_CHAT_ID)
         LOGGER(__name__).info(f"Auto-forward enabled. Target chat: {forward_chat_id}")
 
+
+async def shutdown():
+    """Close both clients, but never let closing them be what hangs.
+
+    Client.stop() waits for the dispatcher to drain, and a handler parked in a
+    download that is not coming back never drains. Past that wait there is
+    nothing left worth saving -- the batch state is already on disk.
+    """
+    for client, name in ((bot, "bot"), (user, "user")):
+        try:
+            await asyncio.wait_for(client.stop(), timeout=SHUTDOWN_TIMEOUT)
+        except Exception as e:
+            LOGGER(__name__).warning(f"Forcing {name} client shutdown: {e}")
+
+
+async def run_bot():
+    """Start both clients and idle until interrupted.
+
+    Written out rather than using bot.run() so Ctrl+C has somewhere to land:
+    bot.run()'s idle waits on the same event loop the downloads run on, and its
+    stop() then waits on those downloads, so the first Ctrl+C could appear to do
+    nothing for as long as a transfer took to give up. Here it cancels the work
+    first, and a second one leaves without waiting at all.
+    """
+    loop = asyncio.get_running_loop()
+
+    # Must be the loop the @bot.on_message decorators saw at import: see the
+    # note in __main__ below. Anything else and the bot connects with no
+    # handlers and answers nothing.
+    assert loop is bot.loop, "run_bot must run on the import-time loop"
+
+    # The user client has no decorators of its own, so nothing has pinned its
+    # loop yet. Left unset, Pyrogram resolves it lazily at first use -- and off
+    # the main thread its resolver invents a fresh loop rather than finding this
+    # one, which surfaces as "attached to a different loop" when a session task
+    # tries to talk to the rest of the program.
+    user.loop = loop
+
+    await initialize()
+    await user.start()
+    await bot.start()
+
+    # A bot with no handlers connects, logs nothing unusual and ignores every
+    # command, which is a miserable thing to debug from the outside. Say the
+    # number out loud at startup so the failure is visible in one line.
+    handlers = len(bot.dispatcher.groups.get(0, []))
+    LOGGER(__name__).info(f"Bot Started! {handlers} handler(s) registered")
+    if not handlers:
+        LOGGER(__name__).error(
+            "No handlers registered -- the bot will not answer any command"
+        )
+
+    stopping = asyncio.Event()
+    interrupts = 0
+
+    def on_interrupt(signum, frame):
+        nonlocal interrupts
+        interrupts += 1
+
+        if interrupts > 1:
+            # The loop itself may be what is stuck -- a large file copy, a
+            # blocked socket -- in which case nothing scheduled on it will ever
+            # run. Leave the hard way rather than ignore a second Ctrl+C.
+            LOGGER(__name__).warning("Second interrupt received; exiting now")
+            os._exit(130)
+
+        print("\nStopping… press Ctrl+C again to force quit.", flush=True)
+        # Touch loop state only from the loop: a signal handler can interrupt it
+        # anywhere, including mid-way through its own bookkeeping.
+        loop.call_soon_threadsafe(_begin_stop)
+
+    def _begin_stop():
+        cancelled = stop_everything()
+        LOGGER(__name__).info(f"Interrupt: cancelled {cancelled} task(s)")
+        stopping.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, on_interrupt)
+
+    # Polled rather than a plain wait(): on Windows a signal is only delivered
+    # when the main thread runs Python code, and an event loop with nothing
+    # scheduled can sit in the OS wait long enough for Ctrl+C to feel ignored.
+    while not stopping.is_set():
+        await asyncio.sleep(0.5)
+
+    await shutdown()
+
+
 if __name__ == "__main__":
+    # bot.loop, not asyncio.run(). Registering a handler does not add it to the
+    # dispatcher there and then -- Dispatcher.add_handler schedules that work as
+    # a task on client.loop, and client.loop is fixed the first time it is read,
+    # which for the decorators above is import time. A fresh loop from
+    # asyncio.run() therefore starts a bot whose thirteen handler registrations
+    # are still sitting unrun on a loop nobody will ever run: it connects, looks
+    # healthy, and silently ignores every command sent to it.
     try:
-        LOGGER(__name__).info("Bot Started!")
-        asyncio.get_event_loop().run_until_complete(initialize())
-        user.start()
-        bot.run()
+        bot.loop.run_until_complete(run_bot())
     except KeyboardInterrupt:
         pass
     except Exception as err:

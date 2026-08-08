@@ -211,19 +211,21 @@ reason, the throughput of each transfer, and any rate limits hit.
 
 ## `/killall`
 
-Cancels every download and upload currently in progress and reports how many
-tasks it stopped:
+Cancels every download and upload currently in progress, along with the batch
+loop driving them, and reports how many tasks it stopped:
 
 ```
-Cancelled 2 running task(s).
+🛑 Stopping — cancelled 3 running task(s).
 ```
 
 Use it when a batch is running longer than you want or a transfer looks stuck.
 
-Two things to know:
+Three things to know:
 
 - It does **not** stop the bot itself — the bot stays up and keeps accepting
   commands.
+- A transfer already in flight takes a few seconds to unwind, so the batch
+  summary arrives shortly after the acknowledgement rather than with it.
 - A cancelled download leaves a partial `.temp` file behind. Follow with
   [`/cleanup`](#cleanup) if space is tight.
 
@@ -233,13 +235,18 @@ exactly where it stopped.
 
 ## `/cleanup`
 
-Deletes everything under `downloads/` and reports what it freed:
+Deletes everything under the staging directory and reports what it freed:
 
 ```
 🧹 Cleanup complete: removed 4 file(s), freed 1.86 GB
 ```
 
 Says `no local downloads found` if there was nothing to remove.
+
+That directory is `DOWNLOAD_DIR`, which defaults to `%TEMP%\RestrictedContentDL`
+— not the `downloads/` folder in the checkout, which is where earlier versions
+staged files. Both are swept, so a leftover from before that move is still
+removed even though nothing writes there any more.
 
 Files are normally cleaned up automatically once a download has been sent to
 you, so anything left over comes from a cancelled task or a bot that was killed

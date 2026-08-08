@@ -112,8 +112,10 @@ async def finalize(temp_path: str, file_path: str) -> None:
             delay *= 2
 
     # A copy only needs read access, so it can still succeed while whatever holds
-    # the file is blocking the delete half of a rename.
-    shutil.copyfile(temp_path, file_path)
+    # the file is blocking the delete half of a rename. On a thread, because
+    # copying a multi-gigabyte file inline stops the event loop for as long as it
+    # takes -- no progress edits, no commands answered, no Ctrl+C.
+    await asyncio.to_thread(shutil.copyfile, temp_path, file_path)
     try:
         os.remove(temp_path)
     except OSError as e:
