@@ -1,7 +1,12 @@
 # Prints which Telegram datacenter your SESSION_STRING lives on, so you can put
-# the VPS next to it. Transfer speed is dominated by the round trip to that DC:
-# every one of DOWNLOAD_WORKERS parallel connections pays the latency on every
-# chunk, so a box 5 ms away and one 180 ms away are not the same machine.
+# the VPS next to it.
+#
+# Proximity is a modest win, not the main one. Each worker awaits one 1 MiB
+# chunk at a time, so the round trip is dead time added to every chunk -- but
+# Telegram's per-connection throttle dominates that transfer, and the RTT is a
+# ~10% garnish on top. The reason to get this right anyway is that the choice is
+# irreversible: ~70 ms from India to Singapore is a garnish, while ~200 ms from
+# a US or EU region is a third of your throughput, permanently.
 #
 # Reads config.env locally and connects to nothing. It never prints the session
 # string or the auth key.

@@ -1,10 +1,20 @@
 # Deploying to a free Oracle Cloud VPS
 
-Running the bot next to Telegram's datacenter instead of on a home connection is
-the largest speed change available to it. Both halves of every transfer — the
-download from Telegram and the upload back — stop being limited by a domestic
-uplink, and the parallel-connection tuning that barely helps at home starts to
-pay off in full.
+Moving the bot off a home connection is the largest speed change available to
+it — but not for the reason it first appears.
+
+Telegram throttles throughput **per connection**, not per account, which is why
+`DOWNLOAD_WORKERS` exists at all: you don't outrun the throttle, you open N
+connections and each gets its own allowance. That premise depends entirely on
+the link keeping those connections alive, and on a domestic line it does not.
+The measurement in [fastdl.py](../helpers/fastdl.py#L13) is stark — **0.44 MB/s
+on 4 workers against 1.31 MB/s on one**, because every reset costs a retry.
+Parallelism is currently net negative.
+
+A datacenter link doesn't drop them, so 8 workers finally multiply instead of
+collapsing, and the upload half stops being capped by an asymmetric domestic
+uplink. That is where the gain lives. Proximity to the DC adds perhaps 10% on
+top — worth having, not the headline.
 
 Oracle Cloud's **Always Free** tier is the only free offering with enough
 bandwidth to matter. The relevant numbers:
@@ -25,6 +35,13 @@ practical ceiling is around 10 TB of uploaded media per month.
 
 Your **home region is permanent**, chosen during signup, and Always Free
 resources only exist there. Getting it wrong means a new account.
+
+Each worker awaits one 1 MiB chunk at a time, so the round trip is dead time
+added to every chunk. From India to Singapore that is ~70 ms against a throttled
+transfer of several hundred — a garnish. From a US or EU region it is ~200 ms,
+which costs a third of your throughput on every chunk for the life of the
+account. Pick correctly because picking wrongly is irreversible, not because the
+right pick is dramatic.
 
 This session lives on **DC5, Singapore**, so the home region should be
 **Singapore (ap-singapore-1)**. Confirm before signing up:
